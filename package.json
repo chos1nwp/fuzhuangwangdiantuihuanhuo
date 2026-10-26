@@ -1,8 +1,8 @@
 {
   "name": "clothes-after-sale",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "服装网店退换货处理系统 · 模拟售后协作平台",
+  "description": "服装网店退换货处理系统 · 模拟售后协作平台（Node.js + Express + MySQL）",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -10,13 +10,21 @@
     "reset": "node scripts/reset.js",
     "test": "node test/acceptance.js"
   },
-  "keywords": ["售后", "退换货", "nodejs", "sqlite", "教学项目"],
+  "keywords": [
+    "售后",
+    "退换货",
+    "nodejs",
+    "express",
+    "mysql",
+    "教学项目"
+  ],
   "author": "",
   "license": "MIT",
   "engines": {
     "node": ">=22.13"
   },
   "dependencies": {
-    "express": "^4.22.3"
+    "express": "^4.22.3",
+    "mysql2": "^3.24.6"
   }
 }

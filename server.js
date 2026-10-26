@@ -11,7 +11,12 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const {
-  db,
+  DB,
+  init: initDb,
+  get,
+  all,
+  run,
+  tx,
   now,
   addDays,
   hashPassword,
@@ -33,6 +38,11 @@ class HttpError extends Error {
     super(message);
     this.status = status;
   }
+}
+
+/** Express 4 不会捕获 async 函数里抛出的异常，统一包一层转交给错误中间件 */
+function ah(handler) {
+  return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 }
 
 /* ------------------------------------------------------------------ */
@@ -101,13 +111,14 @@ function optionalText(value, max = 300) {
   return s;
 }
 
-function availableQty(itemId) {
-  const item = db.prepare('SELECT qty FROM order_items WHERE id = ?').get(itemId);
+async function availableQty(itemId) {
+  const item = await get('SELECT qty FROM order_items WHERE id = ?', itemId);
   if (!item) return 0;
-  const used = db
-    .prepare("SELECT COALESCE(SUM(qty), 0) AS s FROM cases WHERE order_item_id = ? AND status NOT IN ('rejected','cancelled')")
-    .get(itemId).s;
-  return Math.max(0, item.qty - used);
+  const used = await get(
+    "SELECT COALESCE(SUM(qty), 0) AS s FROM cases WHERE order_item_id = ? AND status NOT IN ('rejected','cancelled')",
+    itemId
+  );
+  return Math.max(0, item.qty - Number(used.s));
 }
 
 function deadlineInfo(completedAt) {
@@ -121,11 +132,11 @@ function deadlineInfo(completedAt) {
   };
 }
 
-function nextNo(prefix, table, column) {
+async function nextNo(prefix, table, column) {
   const d = new Date();
   const head = `${prefix}${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`;
-  const row = db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE ${column} LIKE ?`).get(`${head}%`);
-  return `${head}${String(row.n + 1).padStart(3, '0')}`;
+  const row = await get(`SELECT COUNT(*) AS n FROM ${table} WHERE ${column} LIKE ?`, `${head}%`);
+  return `${head}${String(Number(row.n) + 1).padStart(3, '0')}`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -165,11 +176,12 @@ function actionsFor(row, user) {
 /* 序列化                                                               */
 /* ------------------------------------------------------------------ */
 
-function baseCase(row, user) {
+async function baseCase(row, user) {
   const dl = deadlineInfo(row.completed_at);
-  const insp = db
-    .prepare('SELECT package_no, receive_note, received_at, received_by, result, issue_type, inspect_note, inspected_at, inspected_by FROM inspections WHERE case_id = ?')
-    .get(row.id);
+  const insp = await get(
+    'SELECT package_no, receive_note, received_at, received_by, result, issue_type, inspect_note, inspected_at, inspected_by FROM inspections WHERE case_id = ?',
+    row.id
+  );
   return {
     id: row.id,
     caseNo: row.case_no,
@@ -215,7 +227,7 @@ function baseCase(row, user) {
     reshipTracking: row.reship_tracking,
     reshipCompany: row.reship_company,
     closeNote: row.close_note,
-    availableQty: availableQty(row.order_item_id),
+    availableQty: await availableQty(row.order_item_id),
     suggestedRefund: Number((row.unit_price * row.qty).toFixed(2)),
     availableActions: actionsFor(row, user),
     inspection: insp
@@ -235,29 +247,34 @@ function baseCase(row, user) {
   };
 }
 
-function caseDetail(row, user) {
-  const data = baseCase(row, user);
-  const insp = db.prepare('SELECT * FROM inspections WHERE case_id = ?').get(row.id);
-  const attachments = db
-    .prepare('SELECT id, scene, name, mime, created_at FROM attachments WHERE case_id = ? ORDER BY id')
-    .all(row.id)
-    .map((a) => ({ id: a.id, scene: a.scene, name: a.name, url: `/api/attachments/${a.id}`, createdAt: a.created_at }));
+async function caseDetail(row, user) {
+  const data = await baseCase(row, user);
+  const insp = await get('SELECT * FROM inspections WHERE case_id = ?', row.id);
+  const attachmentRows = await all(
+    'SELECT id, scene, name, mime, created_at FROM attachments WHERE case_id = ? ORDER BY id',
+    row.id
+  );
+  const attachments = attachmentRows.map((a) => ({
+    id: a.id,
+    scene: a.scene,
+    name: a.name,
+    url: `/api/attachments/${a.id}`,
+    createdAt: a.created_at,
+  }));
 
-  const timeline = db
-    .prepare('SELECT * FROM timeline WHERE case_id = ? ORDER BY created_at, id')
-    .all(row.id)
-    .map((t) => ({
-      id: t.id,
-      role: t.role,
-      roleLabel: ROLE_LABEL[t.role] || '系统',
-      actor: t.actor,
-      action: t.action,
-      actionLabel: ACTIONS[t.action] || t.action,
-      note: t.note,
-      statusFrom: t.status_from,
-      statusTo: t.status_to,
-      createdAt: t.created_at,
-    }));
+  const timelineRows = await all('SELECT * FROM timeline WHERE case_id = ? ORDER BY created_at, id', row.id);
+  const timeline = timelineRows.map((t) => ({
+    id: t.id,
+    role: t.role,
+    roleLabel: ROLE_LABEL[t.role] || '系统',
+    actor: t.actor,
+    action: t.action,
+    actionLabel: ACTIONS[t.action] || t.action,
+    note: t.note,
+    statusFrom: t.status_from,
+    statusTo: t.status_to,
+    createdAt: t.created_at,
+  }));
 
   data.attachments = attachments;
   data.timeline = timeline;
@@ -279,8 +296,8 @@ function caseDetail(row, user) {
   return data;
 }
 
-function loadCaseRow(id) {
-  return db.prepare(`${CASE_SELECT} WHERE c.id = ?`).get(Number(id));
+async function loadCaseRow(id) {
+  return get(`${CASE_SELECT} WHERE c.id = ?`, Number(id));
 }
 
 function assertVisible(row, user) {
@@ -407,12 +424,12 @@ const ACTION_DEFS = {
   refund: {
     roles: ['service'],
     states: ['inspected'],
-    run({ row, body }) {
+    async run({ row, body }) {
       const amount = Number(body.amount);
       const cap = Number((row.unit_price * row.qty).toFixed(2));
       if (!Number.isFinite(amount) || amount <= 0) throw new HttpError(400, '退款金额必须大于 0');
       if (amount > cap + 0.001) throw new HttpError(400, `退款金额不能超过本单商品金额 ¥${cap.toFixed(2)}`);
-      const refundNo = nextNo('RF', 'cases', 'refund_no');
+      const refundNo = await nextNo('RF', 'cases', 'refund_no');
       const rounded = Number(amount.toFixed(2));
       const note =
         optionalText(body.note) ||
@@ -456,7 +473,7 @@ const ACTION_DEFS = {
   resolve_issue: {
     roles: ['service'],
     states: ['inspect_issue'],
-    run({ row, body }) {
+    async run({ row, body }) {
       const outcome = body.outcome;
       const note = needText(body.note, '处理验货异常必须填写结论说明');
       const cap = Number((row.unit_price * row.qty).toFixed(2));
@@ -474,7 +491,7 @@ const ACTION_DEFS = {
         const amount = Number(body.amount);
         if (!Number.isFinite(amount) || amount <= 0) throw new HttpError(400, '退款金额必须大于 0');
         if (amount > cap + 0.001) throw new HttpError(400, `退款金额不能超过本单商品金额 ¥${cap.toFixed(2)}`);
-        const refundNo = nextNo('RF', 'cases', 'refund_no');
+        const refundNo = await nextNo('RF', 'cases', 'refund_no');
         const rounded = Number(amount.toFixed(2));
         return {
           status: 'completed',
@@ -573,19 +590,25 @@ function parseUploads(list, max = 5) {
 /* 应用                                                                 */
 /* ------------------------------------------------------------------ */
 
-function createApp() {
+async function createApp() {
+  await initDb();
+
   const app = express();
 
   app.use(express.json({ limit: '12mb' }));
 
-  app.use((req, res, next) => {
-    const sid = getCookie(req, 'sid');
-    const uid = sid ? sessions.get(sid) : null;
-    if (uid) {
-      const u = db.prepare('SELECT id, name, phone, role, title FROM users WHERE id = ?').get(uid);
-      if (u) req.user = u;
+  app.use(async (req, res, next) => {
+    try {
+      const sid = getCookie(req, 'sid');
+      const uid = sid ? sessions.get(sid) : null;
+      if (uid) {
+        const u = await get('SELECT id, name, phone, role, title FROM users WHERE id = ?', uid);
+        if (u) req.user = u;
+      }
+      next();
+    } catch (err) {
+      next(err);
     }
-    next();
   });
 
   const requireAuth = (req, res, next) => {
@@ -601,18 +624,21 @@ function createApp() {
 
   /* ---------------- 认证 ---------------- */
 
-  app.post('/api/login', (req, res) => {
-    const phone = trim(req.body && req.body.phone);
-    const password = trim(req.body && req.body.password);
-    const u = db.prepare('SELECT * FROM users WHERE phone = ?').get(phone);
-    if (!u || u.password_hash !== hashPassword(password)) {
-      return res.status(401).json({ error: '手机号或密码不正确' });
-    }
-    const sid = crypto.randomUUID();
-    sessions.set(sid, u.id);
-    res.setHeader('Set-Cookie', `sid=${sid}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400`);
-    res.json(publicUser(u));
-  });
+  app.post(
+    '/api/login',
+    ah(async (req, res) => {
+      const phone = trim(req.body && req.body.phone);
+      const password = trim(req.body && req.body.password);
+      const u = await get('SELECT * FROM users WHERE phone = ?', phone);
+      if (!u || u.password_hash !== hashPassword(password)) {
+        return res.status(401).json({ error: '手机号或密码不正确' });
+      }
+      const sid = crypto.randomUUID();
+      sessions.set(sid, u.id);
+      res.setHeader('Set-Cookie', `sid=${sid}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400`);
+      res.json(publicUser(u));
+    })
+  );
 
   app.post('/api/logout', (req, res) => {
     const sid = getCookie(req, 'sid');
@@ -640,36 +666,33 @@ function createApp() {
 
   /* ---------------- 消费者：订单 ---------------- */
 
-  app.get('/api/orders', requireRole('consumer'), (req, res) => {
-    const orders = db
-      .prepare('SELECT * FROM orders WHERE user_id = ? ORDER BY COALESCE(completed_at, created_at) DESC')
-      .all(req.user.id);
+  app.get(
+    '/api/orders',
+    requireRole('consumer'),
+    ah(async (req, res) => {
+      const orders = await all(
+        'SELECT * FROM orders WHERE user_id = ? ORDER BY COALESCE(completed_at, created_at) DESC',
+        req.user.id
+      );
 
-    const result = orders.map((o) => {
-      const items = db.prepare('SELECT * FROM order_items WHERE order_id = ? ORDER BY id').all(o.id);
-      return {
-        id: o.id,
-        orderNo: o.order_no,
-        status: o.status,
-        statusLabel: o.status === 'completed' ? '已完成' : '运输中',
-        totalAmount: o.total_amount,
-        receiver: o.receiver,
-        address: o.address,
-        channel: o.channel,
-        createdAt: o.created_at,
-        completedAt: o.completed_at,
-        ...deadlineInfo(o.completed_at),
-        items: items.map((it) => {
-          const active = db
-            .prepare(
-              `SELECT id, case_no, status, type FROM cases WHERE order_item_id = ? AND status IN (${ACTIVE.map(() => '?').join(',')}) ORDER BY id DESC LIMIT 1`
-            )
-            .get(it.id, ...ACTIVE);
-          const avail = availableQty(it.id);
-          const lastCase = db
-            .prepare('SELECT id, case_no, status FROM cases WHERE order_item_id = ? ORDER BY id DESC LIMIT 1')
-            .get(it.id);
-          return {
+      const result = [];
+      for (const o of orders) {
+        const items = await all('SELECT * FROM order_items WHERE order_id = ? ORDER BY id', o.id);
+        const itemList = [];
+
+        for (const it of items) {
+          const active = await get(
+            `SELECT id, case_no, status, type FROM cases WHERE order_item_id = ? AND status IN (${ACTIVE.map(() => '?').join(',')}) ORDER BY id DESC LIMIT 1`,
+            it.id,
+            ...ACTIVE
+          );
+          const avail = await availableQty(it.id);
+          const lastCase = await get(
+            'SELECT id, case_no, status FROM cases WHERE order_item_id = ? ORDER BY id DESC LIMIT 1',
+            it.id
+          );
+
+          itemList.push({
             id: it.id,
             title: it.title,
             sku: it.sku_no,
@@ -686,245 +709,326 @@ function createApp() {
               ? { id: lastCase.id, caseNo: lastCase.case_no, statusLabel: STATUS[lastCase.status] }
               : null,
             applicable: o.status === 'completed' && avail > 0 && !active,
-          };
-        }),
-      };
-    });
+          });
+        }
 
-    res.json(result);
-  });
+        result.push({
+          id: o.id,
+          orderNo: o.order_no,
+          status: o.status,
+          statusLabel: o.status === 'completed' ? '已完成' : '运输中',
+          totalAmount: o.total_amount,
+          receiver: o.receiver,
+          address: o.address,
+          channel: o.channel,
+          createdAt: o.created_at,
+          completedAt: o.completed_at,
+          ...deadlineInfo(o.completed_at),
+          items: itemList,
+        });
+      }
+
+      res.json(result);
+    })
+  );
 
   /* ---------------- 售后单列表 ---------------- */
 
-  app.get('/api/cases', requireAuth, (req, res) => {
-    let rows = db.prepare(`${CASE_SELECT} ORDER BY c.updated_at DESC, c.id DESC`).all();
+  app.get(
+    '/api/cases',
+    requireAuth,
+    ah(async (req, res) => {
+      let rows = await all(`${CASE_SELECT} ORDER BY c.updated_at DESC, c.id DESC`);
 
-    if (req.user.role === 'consumer') {
-      rows = rows.filter((r) => r.user_id === req.user.id);
-    } else if (req.user.role === 'warehouse') {
-      rows = rows.filter((r) => WAREHOUSE_VISIBLE.includes(r.status));
-    }
+      if (req.user.role === 'consumer') {
+        rows = rows.filter((r) => r.user_id === req.user.id);
+      } else if (req.user.role === 'warehouse') {
+        rows = rows.filter((r) => WAREHOUSE_VISIBLE.includes(r.status));
+      }
 
-    const bucket = trim(req.query.bucket);
-    const bucketMap = {
-      review: ['pending_review', 'need_info'],
-      processing: ['awaiting_return', 'return_shipped', 'received', 'inspected', 'inspect_issue'],
-      done: ['completed', 'rejected', 'cancelled'],
-      receive: ['awaiting_return', 'return_shipped'],
-      inspect: ['received'],
-    };
-    if (bucket && bucketMap[bucket]) {
-      rows = rows.filter((r) => bucketMap[bucket].includes(r.status));
-    }
+      const bucket = trim(req.query.bucket);
+      const bucketMap = {
+        review: ['pending_review', 'need_info'],
+        processing: ['awaiting_return', 'return_shipped', 'received', 'inspected', 'inspect_issue'],
+        done: ['completed', 'rejected', 'cancelled'],
+        receive: ['awaiting_return', 'return_shipped'],
+        inspect: ['received'],
+      };
+      if (bucket && bucketMap[bucket]) {
+        rows = rows.filter((r) => bucketMap[bucket].includes(r.status));
+      }
 
-    const status = trim(req.query.status);
-    if (status && STATUS[status]) rows = rows.filter((r) => r.status === status);
+      const status = trim(req.query.status);
+      if (status && STATUS[status]) rows = rows.filter((r) => r.status === status);
 
-    const q = trim(req.query.q).toLowerCase();
-    if (q) {
-      rows = rows.filter((r) =>
-        [r.case_no, r.order_no, r.buyer_name, r.item_title, r.buyer_phone].join(' ').toLowerCase().includes(q)
-      );
-    }
+      const keyword = trim(req.query.q).toLowerCase();
+      if (keyword) {
+        rows = rows.filter((r) =>
+          [r.case_no, r.order_no, r.buyer_name, r.item_title, r.buyer_phone].join(' ').toLowerCase().includes(keyword)
+        );
+      }
 
-    res.json(rows.map((r) => baseCase(r, req.user)));
-  });
+      const data = [];
+      for (const r of rows) data.push(await baseCase(r, req.user));
+      res.json(data);
+    })
+  );
 
   /* ---------------- 工作台统计 ---------------- */
 
-  app.get('/api/workbench', requireAuth, (req, res) => {
-    let rows = db.prepare('SELECT status, type, updated_at FROM cases').all();
-    if (req.user.role === 'consumer') return res.status(403).json({ error: '当前岗位无需工作台' });
-    if (req.user.role === 'warehouse') rows = rows.filter((r) => WAREHOUSE_VISIBLE.includes(r.status));
+  app.get(
+    '/api/workbench',
+    requireAuth,
+    ah(async (req, res) => {
+      let rows = await all('SELECT status, type, updated_at FROM cases');
+      if (req.user.role === 'consumer') return res.status(403).json({ error: '当前岗位无需工作台' });
+      if (req.user.role === 'warehouse') rows = rows.filter((r) => WAREHOUSE_VISIBLE.includes(r.status));
 
-    const count = (list) => rows.filter((r) => list.includes(r.status)).length;
-    const today = now().slice(0, 10);
+      const count = (list) => rows.filter((r) => list.includes(r.status)).length;
+      const today = now().slice(0, 10);
 
-    res.json({
-      pendingReview: count(['pending_review']),
-      needInfo: count(['need_info']),
-      awaitingReturn: count(['awaiting_return']),
-      returnShipped: count(['return_shipped']),
-      toResolve: count(['inspected', 'inspect_issue']),
-      issueCount: count(['inspect_issue']),
-      toReceive: count(['awaiting_return', 'return_shipped']),
-      toInspect: count(['received']),
-      inspectedToday: rows.filter((r) => (r.status === 'inspected' || r.status === 'inspect_issue') && (r.updated_at || '').slice(0, 10) === today).length,
-      completedToday: rows.filter((r) => r.status === 'completed' && (r.updated_at || '').slice(0, 10) === today).length,
-    });
-  });
+      res.json({
+        pendingReview: count(['pending_review']),
+        needInfo: count(['need_info']),
+        awaitingReturn: count(['awaiting_return']),
+        returnShipped: count(['return_shipped']),
+        toResolve: count(['inspected', 'inspect_issue']),
+        issueCount: count(['inspect_issue']),
+        toReceive: count(['awaiting_return', 'return_shipped']),
+        toInspect: count(['received']),
+        inspectedToday: rows.filter(
+          (r) => (r.status === 'inspected' || r.status === 'inspect_issue') && (r.updated_at || '').slice(0, 10) === today
+        ).length,
+        completedToday: rows.filter((r) => r.status === 'completed' && (r.updated_at || '').slice(0, 10) === today)
+          .length,
+      });
+    })
+  );
 
   /* ---------------- 售后单详情 ---------------- */
 
-  app.get('/api/cases/:id', requireAuth, (req, res) => {
-    const row = loadCaseRow(req.params.id);
-    assertVisible(row, req.user);
-    res.json(caseDetail(row, req.user));
-  });
+  app.get(
+    '/api/cases/:id',
+    requireAuth,
+    ah(async (req, res) => {
+      const row = await loadCaseRow(req.params.id);
+      assertVisible(row, req.user);
+      res.json(await caseDetail(row, req.user));
+    })
+  );
 
   /* ---------------- 创建售后单 ---------------- */
 
-  app.post('/api/cases', requireRole('consumer'), (req, res) => {
-    const body = req.body || {};
-    const item = db
-      .prepare(
+  app.post(
+    '/api/cases',
+    requireRole('consumer'),
+    ah(async (req, res) => {
+      const body = req.body || {};
+      const item = await get(
         `SELECT i.*, o.user_id, o.status AS order_status, o.completed_at, o.order_no
-         FROM order_items i JOIN orders o ON o.id = i.order_id WHERE i.id = ?`
-      )
-      .get(Number(body.orderItemId));
-
-    if (!item) throw new HttpError(404, '订单商品不存在');
-    if (item.user_id !== req.user.id) throw new HttpError(403, '只能对本人订单申请售后');
-    if (item.order_status !== 'completed') throw new HttpError(409, '该订单尚未完成，暂不能申请售后');
-
-    const type = body.type === 'exchange' ? 'exchange' : body.type === 'return' ? 'return' : null;
-    if (!type) throw new HttpError(400, '请选择售后类型');
-    if (!REASONS[body.reason]) throw new HttpError(400, '请选择申请原因');
-
-    const qty = Number(body.qty);
-    if (!Number.isInteger(qty) || qty < 1) throw new HttpError(400, '申请数量必须是大于 0 的整数');
-
-    const avail = availableQty(item.id);
-    const duplicate = db
-      .prepare(`SELECT case_no FROM cases WHERE order_item_id = ? AND status IN (${ACTIVE.map(() => '?').join(',')})`)
-      .get(item.id, ...ACTIVE);
-    if (duplicate) {
-      throw new HttpError(409, `该商品已有进行中的售后单 ${duplicate.case_no}，请先处理完成后再申请`);
-    }
-    if (avail <= 0) throw new HttpError(409, '该商品可售后数量已用完，无法再次申请');
-    if (qty > avail) throw new HttpError(409, `该商品可售后数量为 ${avail} 件，无法申请 ${qty} 件`);
-
-    const exchangeSize = optionalText(body.exchangeSize, 20);
-    if (type === 'exchange' && !exchangeSize) throw new HttpError(400, '换货请填写期望更换的尺码或颜色');
-
-    const files = parseUploads(body.attachments);
-
-    const description = optionalText(body.description, 500);
-    const caseNo = nextNo('AS', 'cases', 'case_no');
-    const ts = now();
-    const dl = deadlineInfo(item.completed_at);
-
-    const info = db
-      .prepare(
-        `INSERT INTO cases (case_no, order_id, order_item_id, user_id, type, reason, qty, description,
-          exchange_size, status, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
-      )
-      .run(
-        caseNo,
-        item.order_id,
-        item.id,
-        req.user.id,
-        type,
-        body.reason,
-        qty,
-        description || null,
-        exchangeSize || null,
-        'pending_review',
-        ts,
-        ts
+         FROM order_items i JOIN orders o ON o.id = i.order_id WHERE i.id = ?`,
+        Number(body.orderItemId)
       );
 
-    const caseId = Number(info.lastInsertRowid);
+      if (!item) throw new HttpError(404, '订单商品不存在');
+      if (item.user_id !== req.user.id) throw new HttpError(403, '只能对本人订单申请售后');
+      if (item.order_status !== 'completed') throw new HttpError(409, '该订单尚未完成，暂不能申请售后');
 
-    const createdNote = `申请${type === 'exchange' ? '换货' : '退货退款'} ${qty} 件，原因：${REASONS[body.reason].label}${
-      dl.overdue ? `（该订单已完成 ${SERVICE_DAYS + Math.abs(dl.daysLeft)} 天，超出 ${SERVICE_DAYS} 天受理期限）` : ''
-    }`;
+      const type = body.type === 'exchange' ? 'exchange' : body.type === 'return' ? 'return' : null;
+      if (!type) throw new HttpError(400, '请选择售后类型');
+      if (!REASONS[body.reason]) throw new HttpError(400, '请选择申请原因');
 
-    db.prepare(
-      `INSERT INTO timeline (case_id, role, actor, action, note, status_from, status_to, created_at)
-       VALUES (?,?,?,?,?,?,?,?)`
-    ).run(caseId, 'consumer', req.user.name, 'created', createdNote, null, 'pending_review', ts);
+      const qty = Number(body.qty);
+      if (!Number.isInteger(qty) || qty < 1) throw new HttpError(400, '申请数量必须是大于 0 的整数');
 
-    const ins = db.prepare(
-      'INSERT INTO attachments (case_id, scene, name, mime, data, uploaded_by, created_at) VALUES (?,?,?,?,?,?,?)'
-    );
-    for (const f of files) ins.run(caseId, 'apply', f.name, f.mime, f.data, req.user.id, ts);
+      const avail = await availableQty(item.id);
+      const duplicate = await get(
+        `SELECT case_no FROM cases WHERE order_item_id = ? AND status IN (${ACTIVE.map(() => '?').join(',')})`,
+        item.id,
+        ...ACTIVE
+      );
+      if (duplicate) {
+        throw new HttpError(409, `该商品已有进行中的售后单 ${duplicate.case_no}，请先处理完成后再申请`);
+      }
+      if (avail <= 0) throw new HttpError(409, '该商品可售后数量已用完，无法再次申请');
+      if (qty > avail) throw new HttpError(409, `该商品可售后数量为 ${avail} 件，无法申请 ${qty} 件`);
 
-    res.status(201).json(caseDetail(loadCaseRow(caseId), req.user));
-  });
+      const exchangeSize = optionalText(body.exchangeSize, 20);
+      if (type === 'exchange' && !exchangeSize) throw new HttpError(400, '换货请填写期望更换的尺码或颜色');
+
+      const files = parseUploads(body.attachments);
+
+      const description = optionalText(body.description, 500);
+      const caseNo = await nextNo('AS', 'cases', 'case_no');
+      const ts = now();
+      const dl = deadlineInfo(item.completed_at);
+
+      const createdNote = `申请${type === 'exchange' ? '换货' : '退货退款'} ${qty} 件，原因：${REASONS[body.reason].label}${
+        dl.overdue ? `（该订单已完成 ${SERVICE_DAYS + Math.abs(dl.daysLeft)} 天，超出 ${SERVICE_DAYS} 天受理期限）` : ''
+      }`;
+
+      // 主单、时间线、凭证要么全部写入，要么全部回滚
+      const caseId = await tx(async (t) => {
+        const info = await t.run(
+          `INSERT INTO cases (case_no, order_id, order_item_id, user_id, type, reason, qty, description,
+            exchange_size, status, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+          caseNo,
+          item.order_id,
+          item.id,
+          req.user.id,
+          type,
+          body.reason,
+          qty,
+          description || null,
+          exchangeSize || null,
+          'pending_review',
+          ts,
+          ts
+        );
+
+        const id = info.insertId;
+
+        await t.run(
+          `INSERT INTO timeline (case_id, role, actor, action, note, status_from, status_to, created_at)
+           VALUES (?,?,?,?,?,?,?,?)`,
+          id,
+          'consumer',
+          req.user.name,
+          'created',
+          createdNote,
+          null,
+          'pending_review',
+          ts
+        );
+
+        for (const f of files) {
+          await t.run(
+            'INSERT INTO attachments (case_id, scene, name, mime, data, uploaded_by, created_at) VALUES (?,?,?,?,?,?,?)',
+            id,
+            'apply',
+            f.name,
+            f.mime,
+            f.data,
+            req.user.id,
+            ts
+          );
+        }
+
+        return id;
+      });
+
+      res.status(201).json(await caseDetail(await loadCaseRow(caseId), req.user));
+    })
+  );
 
   /* ---------------- 执行操作 ---------------- */
 
-  app.post('/api/cases/:id/actions', requireAuth, (req, res) => {
-    const body = req.body || {};
-    const action = trim(body.action);
-    const def = ACTION_DEFS[action];
-    if (!def) throw new HttpError(400, '未知操作');
+  app.post(
+    '/api/cases/:id/actions',
+    requireAuth,
+    ah(async (req, res) => {
+      const body = req.body || {};
+      const action = trim(body.action);
+      const def = ACTION_DEFS[action];
+      if (!def) throw new HttpError(400, '未知操作');
 
-    const row = loadCaseRow(req.params.id);
-    if (!row) throw new HttpError(404, '售后单不存在');
-    if (!def.roles.includes(req.user.role)) throw new HttpError(403, '当前岗位无权执行该操作');
-    if (req.user.role === 'consumer' && row.user_id !== req.user.id) {
-      throw new HttpError(403, '无权操作他人的售后单');
-    }
-    if (!def.states.includes(row.status)) {
-      throw new HttpError(409, `当前状态为「${STATUS[row.status]}」，不能执行该操作`);
-    }
+      const row = await loadCaseRow(req.params.id);
+      if (!row) throw new HttpError(404, '售后单不存在');
+      if (!def.roles.includes(req.user.role)) throw new HttpError(403, '当前岗位无权执行该操作');
+      if (req.user.role === 'consumer' && row.user_id !== req.user.id) {
+        throw new HttpError(403, '无权操作他人的售后单');
+      }
+      if (!def.states.includes(row.status)) {
+        throw new HttpError(409, `当前状态为「${STATUS[row.status]}」，不能执行该操作`);
+      }
 
-    const result = def.run({ row, body, user: req.user });
-    const ts = now();
+      const result = await def.run({ row, body, user: req.user });
+      const ts = now();
 
-    const fields = result.fields || {};
-    const sets = ['status = ?', 'updated_at = ?'];
-    const values = [result.status, ts];
-    for (const [key, value] of Object.entries(fields)) {
-      sets.push(`${key} = ?`);
-      values.push(value);
-    }
+      const fields = result.fields || {};
+      const sets = ['status = ?', 'updated_at = ?'];
+      const values = [result.status, ts];
+      for (const [key, value] of Object.entries(fields)) {
+        sets.push(`${key} = ?`);
+        values.push(value);
+      }
 
-    db.prepare(`UPDATE cases SET ${sets.join(', ')} WHERE id = ?`).run(...values, row.id);
+      // 状态变更、时间线、验货记录、补充凭证在同一事务内完成
+      await tx(async (t) => {
+        await t.run(`UPDATE cases SET ${sets.join(', ')} WHERE id = ?`, ...values, row.id);
 
-    db.prepare(
-      `INSERT INTO timeline (case_id, role, actor, action, note, status_from, status_to, created_at)
-       VALUES (?,?,?,?,?,?,?,?)`
-    ).run(row.id, req.user.role, req.user.name, result.action, result.note, row.status, result.status, ts);
-
-    if (result.inspection) {
-      const insp = result.inspection;
-      const exist = db.prepare('SELECT id FROM inspections WHERE case_id = ?').get(row.id);
-      if (exist) {
-        const keys = Object.keys(insp);
-        db.prepare(`UPDATE inspections SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE case_id = ?`).run(
-          ...keys.map((k) => insp[k]),
-          row.id
-        );
-      } else {
-        const keys = ['case_id', ...Object.keys(insp)];
-        db.prepare(`INSERT INTO inspections (${keys.join(',')}) VALUES (${keys.map(() => '?').join(',')})`).run(
+        await t.run(
+          `INSERT INTO timeline (case_id, role, actor, action, note, status_from, status_to, created_at)
+           VALUES (?,?,?,?,?,?,?,?)`,
           row.id,
-          ...keys.slice(1).map((k) => insp[k])
+          req.user.role,
+          req.user.name,
+          result.action,
+          result.note,
+          row.status,
+          result.status,
+          ts
         );
-      }
-    }
 
-    if (result.attachments && result.attachments.length) {
-      const ins = db.prepare(
-        'INSERT INTO attachments (case_id, scene, name, mime, data, uploaded_by, created_at) VALUES (?,?,?,?,?,?,?)'
-      );
-      for (const f of result.attachments) {
-        ins.run(row.id, result.scene || 'supplement', f.name, f.mime, f.data, req.user.id, ts);
-      }
-    }
+        if (result.inspection) {
+          const insp = result.inspection;
+          const exist = await t.get('SELECT id FROM inspections WHERE case_id = ?', row.id);
+          if (exist) {
+            const keys = Object.keys(insp);
+            await t.run(
+              `UPDATE inspections SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE case_id = ?`,
+              ...keys.map((k) => insp[k]),
+              row.id
+            );
+          } else {
+            const keys = ['case_id', ...Object.keys(insp)];
+            await t.run(
+              `INSERT INTO inspections (${keys.join(',')}) VALUES (${keys.map(() => '?').join(',')})`,
+              ...keys.map((k) => (k === 'case_id' ? row.id : insp[k]))
+            );
+          }
+        }
 
-    res.json(caseDetail(loadCaseRow(row.id), req.user));
-  });
+        if (result.attachments && result.attachments.length) {
+          for (const f of result.attachments) {
+            await t.run(
+              'INSERT INTO attachments (case_id, scene, name, mime, data, uploaded_by, created_at) VALUES (?,?,?,?,?,?,?)',
+              row.id,
+              result.scene || 'supplement',
+              f.name,
+              f.mime,
+              f.data,
+              req.user.id,
+              ts
+            );
+          }
+        }
+      });
+
+      res.json(await caseDetail(await loadCaseRow(row.id), req.user));
+    })
+  );
 
   /* ---------------- 凭证图片 ---------------- */
 
-  app.get('/api/attachments/:id', requireAuth, (req, res) => {
-    const row = db.prepare('SELECT * FROM attachments WHERE id = ?').get(Number(req.params.id));
-    if (!row) return res.status(404).end();
-    const c = loadCaseRow(row.case_id);
-    try {
-      assertVisible(c, req.user);
-    } catch (e) {
-      return res.status(e.status || 403).json({ error: e.message });
-    }
-    res.setHeader('Content-Type', row.mime);
-    res.setHeader('Cache-Control', 'private, max-age=86400');
-    res.end(Buffer.from(row.data));
-  });
+  app.get(
+    '/api/attachments/:id',
+    requireAuth,
+    ah(async (req, res) => {
+      const row = await get('SELECT * FROM attachments WHERE id = ?', Number(req.params.id));
+      if (!row) return res.status(404).end();
+      const c = await loadCaseRow(row.case_id);
+      try {
+        assertVisible(c, req.user);
+      } catch (e) {
+        return res.status(e.status || 403).json({ error: e.message });
+      }
+      res.setHeader('Content-Type', row.mime);
+      res.setHeader('Cache-Control', 'private, max-age=86400');
+      res.end(Buffer.from(row.data));
+    })
+  );
 
   app.get('/api/health', (req, res) => res.json({ ok: true, time: now() }));
 
@@ -950,11 +1054,19 @@ function createApp() {
 }
 
 if (require.main === module) {
-  const app = createApp();
-  app.listen(PORT, () => {
-    console.log(`\n  衣返 · 服装网店退换货处理系统`);
-    console.log(`  服务已启动：http://localhost:${PORT}\n`);
-  });
+  createApp()
+    .then((app) => {
+      app.listen(PORT, () => {
+        console.log(`\n  衣返 · 服装网店退换货处理系统`);
+        console.log(`  数据库：MySQL ${DB.host}:${DB.port}/${DB.database}`);
+        console.log(`  服务已启动：http://localhost:${PORT}\n`);
+      });
+    })
+    .catch((err) => {
+      console.error('\n  启动失败：', err.message);
+      console.error('  请确认 MySQL 服务已启动，且 .env 中的账号密码正确。\n');
+      process.exit(1);
+    });
 }
 
 module.exports = { createApp, sessions };

@@ -3,18 +3,14 @@
 /**
  * 核心验收场景自动化测试
  * 运行：npm test
- * 说明：使用独立的临时数据库，不影响演示数据。
+ * 说明：使用独立的测试库（默认 clothes_after_sale_test），每次运行前重建，
+ *      不影响演示库 clothes_after_sale。
  */
 
-const fs = require('node:fs');
-const path = require('node:path');
+process.env.DB_NAME = process.env.TEST_DB_NAME || 'clothes_after_sale_test';
 
-const TEST_DB = path.join(__dirname, '.tmp-acceptance.db');
-for (const f of [TEST_DB, `${TEST_DB}-wal`, `${TEST_DB}-shm`]) {
-  if (fs.existsSync(f)) fs.rmSync(f);
-}
-process.env.DB_FILE = TEST_DB;
-
+const store = require('../db');
+const mysql = require('mysql2/promise');
 const { createApp } = require('../server');
 
 const BASE_PORT = 3411;
@@ -36,7 +32,18 @@ function section(title) {
 }
 
 async function main() {
-  const app = createApp();
+  // 先删掉测试库，保证每次运行都从干净的初始数据开始
+  const conn = await mysql.createConnection({
+    host: store.DB.host,
+    port: store.DB.port,
+    user: store.DB.user,
+    password: store.DB.password,
+    charset: 'utf8mb4',
+  });
+  await conn.query(`DROP DATABASE IF EXISTS \`${store.DB.database}\``);
+  await conn.end();
+
+  const app = await createApp();
   const server = await new Promise((resolve) => {
     const s = app.listen(BASE_PORT, () => resolve(s));
   });
@@ -347,15 +354,8 @@ async function main() {
   }
 
   await new Promise((resolve) => server.close(resolve));
-  for (const f of [TEST_DB, `${TEST_DB}-wal`, `${TEST_DB}-shm`]) {
-    if (fs.existsSync(f)) {
-      try {
-        fs.rmSync(f);
-      } catch (e) {
-        /* ignore */
-      }
-    }
-  }
+  const pool = store.getPool();
+  if (pool) await pool.end();
   process.exit(failures.length === 0 ? 0 : 1);
 }
 

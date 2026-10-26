@@ -1,24 +1,42 @@
 'use strict';
 
 /**
- * 重置演示数据库：删除现有 SQLite 文件，下次启动将重新写入模拟数据。
+ * 重置演示数据库：删除 MySQL 库并重建，重新写入模拟数据。
  * 用法：npm run reset
  */
 
-const fs = require('node:fs');
-const path = require('node:path');
+const mysql = require('mysql2/promise');
+const store = require('../db');
 
-const dataDir = path.join(__dirname, '..', 'data');
-const files = ['clothes.db', 'clothes.db-wal', 'clothes.db-shm'];
+(async () => {
+  const { DB } = store;
 
-let removed = 0;
-for (const name of files) {
-  const target = path.join(dataDir, name);
-  if (fs.existsSync(target)) {
-    fs.rmSync(target);
-    removed += 1;
-    console.log(`已删除 ${path.relative(process.cwd(), target)}`);
-  }
-}
+  const conn = await mysql.createConnection({
+    host: DB.host,
+    port: DB.port,
+    user: DB.user,
+    password: DB.password,
+    charset: 'utf8mb4',
+  });
+  await conn.query(`DROP DATABASE IF EXISTS \`${DB.database}\``);
+  await conn.end();
+  console.log(`已删除数据库 ${DB.database}`);
 
-console.log(removed ? '数据库已重置，下次启动会重新写入模拟数据。' : '没有需要重置的数据库文件。');
+  await store.init();
+
+  const counts = await Promise.all([
+    store.get('SELECT COUNT(*) AS n FROM users'),
+    store.get('SELECT COUNT(*) AS n FROM orders'),
+    store.get('SELECT COUNT(*) AS n FROM cases'),
+  ]);
+  console.log(
+    `已重建并写入演示数据：${counts[0].n} 个账号、${counts[1].n} 笔订单、${counts[2].n} 张售后单`
+  );
+
+  const pool = store.getPool();
+  if (pool) await pool.end();
+  console.log('重置完成，执行 npm start 启动服务。');
+})().catch((err) => {
+  console.error('重置失败：', err.message);
+  process.exit(1);
+});
