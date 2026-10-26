@@ -97,6 +97,16 @@ const ACTIONS = {
   cancel: '买家撤销申请',
 };
 
+/**
+ * 仅内部可见的时间线动作。
+ * 仓库的收货、验货属于作业记录，消费者只看到状态变化，看不到包裹号、
+ * 验货细节与内部备注；客服与仓库可以看全量。
+ */
+const INTERNAL_ACTIONS = new Set(['receive', 'inspect_pass', 'inspect_issue']);
+
+/** 终态：进入后单据关闭并记录 closed_at */
+const TERMINAL_STATUS = ['completed', 'rejected', 'cancelled'];
+
 const DEFAULT_RETURN_ADDRESS = '浙江省杭州市余杭区文一西路 969 号 服装仓储中心 A 库 · 售后组（收） 0571-8888 6666';
 
 const SHIPPING_COMPANIES = ['顺丰速运', '中通快递', '圆通速递', '韵达快递', '京东物流'];
@@ -173,6 +183,7 @@ const SCHEMA = [
      close_note      TEXT,
      created_at      DATETIME      NOT NULL,
      updated_at      DATETIME      NOT NULL,
+     closed_at       DATETIME      DEFAULT NULL COMMENT '进入终态的时间，用于统计与 SLA',
      PRIMARY KEY (id),
      UNIQUE KEY uk_cases_no (case_no),
      KEY idx_cases_user (user_id),
@@ -223,6 +234,7 @@ const SCHEMA = [
      note        TEXT,
      status_from VARCHAR(24)  DEFAULT NULL,
      status_to   VARCHAR(24)  DEFAULT NULL,
+     visible_to_consumer TINYINT(1) NOT NULL DEFAULT 1 COMMENT '0=仅内部可见的仓库作业记录',
      created_at  DATETIME     NOT NULL,
      PRIMARY KEY (id),
      KEY idx_timeline_case (case_id),
@@ -287,6 +299,42 @@ async function ensureDatabase() {
 }
 
 /**
+ * 轻量迁移：早期版本建的库缺少后加的字段。
+ * 只在字段不存在时 ALTER，可重复执行；新库建表时已包含这些字段，这里会直接跳过。
+ */
+const MIGRATIONS = [
+  {
+    table: 'cases',
+    column: 'closed_at',
+    ddl: "ALTER TABLE cases ADD COLUMN closed_at DATETIME DEFAULT NULL COMMENT '进入终态的时间，用于统计与 SLA' AFTER updated_at",
+  },
+  {
+    table: 'timeline',
+    column: 'visible_to_consumer',
+    ddl: 'ALTER TABLE timeline ADD COLUMN visible_to_consumer TINYINT(1) NOT NULL DEFAULT 1 AFTER status_to',
+  },
+];
+
+async function migrate() {
+  for (const m of MIGRATIONS) {
+    const [rows] = await pool.query(
+      `SELECT COUNT(*) AS n FROM information_schema.columns
+        WHERE table_schema = ? AND table_name = ? AND column_name = ?`,
+      [DB.database, m.table, m.column]
+    );
+    if (Number(rows[0].n) === 0) await pool.query(m.ddl);
+  }
+
+  // 回填：历史数据里仓库作业记录标记为内部，已结束的单据补上关闭时间
+  await pool.query(
+    "UPDATE timeline SET visible_to_consumer = 0 WHERE action IN ('receive','inspect_pass','inspect_issue') AND visible_to_consumer = 1"
+  );
+  await pool.query(
+    "UPDATE cases SET closed_at = updated_at WHERE status IN ('completed','rejected','cancelled') AND closed_at IS NULL"
+  );
+}
+
+/**
  * 初始化：建库 → 连接池 → 建表 → 首次写入模拟数据
  * 服务启动时调用一次。
  */
@@ -310,10 +358,11 @@ async function init() {
 
   q = bind(pool);
 
-  // 3. 建表 + 种子数据
+  // 3. 建表 + 旧库补列 + 种子数据
   for (const sql of SCHEMA) {
     await pool.query(sql);
   }
+  await migrate();
   await seed();
 
   return pool;
@@ -697,8 +746,8 @@ async function seed() {
       const info = await t.run(
         `INSERT INTO cases (case_no, order_id, order_item_id, user_id, type, reason, qty, description,
           exchange_size, status, return_address, return_tracking, return_company, refund_amount, refund_no,
-          reship_tracking, reship_company, close_note, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          reship_tracking, reship_company, close_note, created_at, updated_at, closed_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         c.no,
         it.orderId,
         it.id,
@@ -718,14 +767,15 @@ async function seed() {
         null,
         c.closeNote || null,
         c.created,
-        c.updated
+        c.updated,
+        TERMINAL_STATUS.includes(c.status) ? c.updated : null
       );
       const cid = info.insertId;
 
       for (const t2 of c.timeline) {
         await t.run(
-          `INSERT INTO timeline (case_id, role, actor, action, note, status_from, status_to, created_at)
-           VALUES (?,?,?,?,?,?,?,?)`,
+          `INSERT INTO timeline (case_id, role, actor, action, note, status_from, status_to, visible_to_consumer, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?)`,
           cid,
           t2[0],
           t2[1],
@@ -733,6 +783,7 @@ async function seed() {
           t2[3],
           t2[4],
           t2[5],
+          INTERNAL_ACTIONS.has(t2[2]) ? 0 : 1,
           t2[6]
         );
       }
@@ -784,6 +835,8 @@ module.exports = {
   ISSUE_TYPES,
   ROLE_LABEL,
   ACTIONS,
+  INTERNAL_ACTIONS,
+  TERMINAL_STATUS,
   SHIPPING_COMPANIES,
   DEFAULT_RETURN_ADDRESS,
   PASSWORD,

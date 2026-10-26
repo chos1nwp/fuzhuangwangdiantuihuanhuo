@@ -86,12 +86,14 @@ async function main() {
   const CHEN = '13800000002';
   const ZHOU = '13800000003';
   const SERVICE = '13900000001';
+  const SERVICE2 = '13900000002';
   const WH = '13700000001';
 
   await login(LIN);
   await login(CHEN);
   await login(ZHOU);
   await login(SERVICE);
+  await login(SERVICE2);
   await login(WH);
 
   /* ---------------------------------------------------------------- */
@@ -341,6 +343,80 @@ async function main() {
 
   const whBench = await call(WH, 'GET', '/api/workbench');
   ok('仓库工作台只统计仓库环节', whBench.status === 200 && typeof whBench.data.toReceive === 'number');
+
+  /* ---------------------------------------------------------------- */
+  section('场景 7 · 两个客服同时处理同一张单，只允许一个成功');
+
+  const freshOrders = await call(LIN, 'GET', '/api/orders');
+  const freeItem = freshOrders.data.flatMap((o) => o.items).find((i) => i.applicable);
+  ok('存在可新申请售后的商品', !!freeItem);
+
+  const raceCase = await call(LIN, 'POST', '/api/cases', {
+    orderItemId: freeItem.id,
+    type: 'return',
+    reason: 'size_not_fit',
+    qty: 1,
+    description: '并发场景用单。',
+  });
+  ok('并发场景的售后单创建成功', raceCase.status === 201 && raceCase.data.status === 'pending_review');
+
+  const raceId = raceCase.data.id;
+  const [raceA, raceB] = await Promise.all([
+    call(SERVICE, 'POST', `/api/cases/${raceId}/actions`, { action: 'approve', note: '并发测试 A' }),
+    call(SERVICE2, 'POST', `/api/cases/${raceId}/actions`, { action: 'approve', note: '并发测试 B' }),
+  ]);
+  const raceStatuses = [raceA.status, raceB.status].sort().join(',');
+  ok('并发同意退回只有一个成功、另一个 409', raceStatuses === '200,409', [raceA.status, raceB.status]);
+  const loser = raceA.status === 409 ? raceA : raceB;
+  ok('失败方收到可读的冲突提示', !!loser.data && /刚被其他人处理|不能执行该操作/.test(loser.data.error), loser.data);
+
+  const raceDetail = await call(SERVICE, 'GET', `/api/cases/${raceId}`);
+  ok(
+    '并发下只写入一条审核记录，状态只前进一次',
+    raceDetail.data.status === 'awaiting_return' &&
+      raceDetail.data.timeline.filter((t) => t.action === 'approve').length === 1,
+    { status: raceDetail.data.status, approves: raceDetail.data.timeline.filter((t) => t.action === 'approve').length }
+  );
+
+  /* ---------------------------------------------------------------- */
+  section('场景 8 · 仓库作业记录仅内部可见，消费者只看到对外时间线');
+
+  const asConsumer = await call(LIN, 'GET', `/api/cases/${newId}`);
+  const asService = await call(SERVICE, 'GET', `/api/cases/${newId}`);
+  const internalActions = ['receive', 'inspect_pass', 'inspect_issue'];
+
+  ok(
+    '消费者时间线不含仓库收货与验货记录',
+    asConsumer.data.timeline.every((t) => !internalActions.includes(t.action)),
+    asConsumer.data.timeline.map((t) => t.action)
+  );
+  ok(
+    '客服时间线包含内部记录，且条数差等于被隐藏条数',
+    asService.data.timeline.some((t) => t.internal) &&
+      asService.data.timeline.length - asConsumer.data.timeline.length ===
+        asService.data.timeline.filter((t) => t.internal).length,
+    { consumer: asConsumer.data.timeline.length, service: asService.data.timeline.length }
+  );
+  ok('消费者详情不返回验货明细与内部备注', asConsumer.data.inspection === null, asConsumer.data.inspection);
+  ok(
+    '客服仍可查看完整验货明细',
+    asService.data.inspection && asService.data.inspection.result === 'issue' && !!asService.data.inspection.note,
+    asService.data.inspection
+  );
+
+  /* ---------------------------------------------------------------- */
+  section('场景 9 · 单据关闭时间用于统计口径');
+
+  ok('完成后写入关闭时间 closedAt', !!asService.data.closedAt, asService.data.closedAt);
+  ok(
+    '未完成的单据不写关闭时间',
+    (await call(SERVICE, 'GET', `/api/cases/${raceId}`)).data.closedAt === null
+  );
+  ok(
+    '工作台「今日完成」按关闭时间统计',
+    ledger.data.completedToday >= 1,
+    (await call(SERVICE, 'GET', '/api/workbench')).data.completedToday
+  );
 
   /* ---------------------------------------------------------------- */
 

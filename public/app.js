@@ -1336,6 +1336,7 @@ async function renderCaseDetail(id) {
         <span>买家 <b>${esc(c.buyer.name)}</b></span>
         <span>提交时间 <b>${fmtFull(c.createdAt)}</b></span>
         <span>受理期限 <b>${c.deadlineAt ? c.deadlineAt.slice(0, 10) : '—'}</b></span>
+        ${c.closedAt ? `<span>关闭时间 <b>${fmtFull(c.closedAt)}</b></span>` : ''}
       </div>
       <div class="steps">${steps}</div>
       ${statusDesc ? `<div class="banner ${terminal ? 'danger' : c.status === 'inspect_issue' ? 'warn' : c.status === 'completed' ? 'ok' : 'info'}" style="margin-top:14px">${icon(c.status === 'completed' ? 'checkCircle' : terminal || c.status === 'inspect_issue' ? 'alert' : 'clock', 15)}<span>${esc(statusDesc)}</span></div>` : ''}
@@ -1398,6 +1399,7 @@ async function renderCaseDetail(id) {
         <section class="card">
           <div class="card-head"><h3>售后时间线</h3><span class="card-sub">岗位 · 时间 · 说明</span><div class="spacer"></div><span class="chip">${c.timeline.length} 条记录</span></div>
           <div class="card-body">
+            ${state.user.role === 'consumer' && c.internalCount ? `<div class="tl-tip">${icon('shield', 14)}<span>仓库收货与验货属于内部作业记录，共 ${c.internalCount} 条，不在买家时间线展示。</span></div>` : ''}
             <div class="timeline">
               ${c.timeline
                 .map(
@@ -1407,6 +1409,7 @@ async function renderCaseDetail(id) {
                       <span class="role-tag ${t.role}">${esc(t.roleLabel)}</span>
                       <span class="tl-actor">${esc(t.actor)}</span>
                       <span class="tl-action">${esc(t.actionLabel)}</span>
+                      ${t.internal ? `<span class="tl-internal">仅内部可见</span>` : ''}
                       <span class="tl-time">${fmtFull(t.createdAt)}</span>
                     </div>
                     ${t.note ? `<div class="tl-note">${esc(t.note)}</div>` : ''}

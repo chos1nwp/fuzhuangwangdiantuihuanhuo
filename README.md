@@ -28,7 +28,7 @@ npm start
 | --------------- | ------------------------------------- |
 | `npm start`     | 启动服务（首次启动自动建库建表并写入模拟数据）               |
 | `npm run reset` | 删除并重建数据库，重新生成模拟数据                     |
-| `npm test`      | 运行 6 组核心验收场景自动化测试（独立测试库，不影响演示数据）      |
+| `npm test`      | 运行 9 组核心验收场景自动化测试（独立测试库，不影响演示数据）      |
 
 > 说明：本项目只模拟售后协作，不接入真实电商平台、支付、快递接口。所有订单、退款单号、补发单号均为模拟数据。
 
@@ -155,6 +155,9 @@ docker compose up -d --build
 | 仓库验货不等于退款/换货完成    | `inspect` 只置为 `inspected` / `inspect_issue`          | 必须由客服再确认结果         |
 | 拒绝、补充、验货异常必须填原因   | 各操作 `needText()` 校验                                  | 空原因返回 400          |
 | 每次状态变化保留岗位、时间、说明  | 所有操作统一写入 `timeline` 表                                | 详情页时间线可追溯          |
+| 并发处理同一张单只能成功一次    | 更新语句带状态条件 `WHERE id=? AND status=?`，影响行数为 0 即回滚 | 后到的一方收到 409，需刷新重试 |
+| 仓库作业记录不对外展示       | `timeline.visible_to_consumer`，消费者查询时过滤                 | 买家只看到状态，客服看全量     |
+| 关闭时间可统计           | 进入终态时写入 `closed_at`                                 | 工作台「今日完成」按关闭时间统计  |
 | 普通消费者不能查看他人资料     | 列表按角色过滤 + `assertVisible()`                          | 详情/凭证图片均返回 403     |
 | 退款不接真实资金          | 生成 `refund_no` 与金额记录                                 | 页面标注「模拟退款」         |
 | 换货必须记录补发单号        | `exchange`、`resolve_issue(exchange)` 校验 `tracking`   | 完成后买家可见补发信息        |
@@ -166,10 +169,10 @@ docker compose up -d --build
 | `users`       | 三类岗位账号  | `role`（consumer / service / warehouse）          |
 | `orders`      | 模拟订单    | `status`、`completed_at`（售后期限起点）                 |
 | `order_items` | 订单商品    | `qty`、`unit_price`、颜色/尺码/SKU                    |
-| `cases`       | 售后单主表   | `type`、`status`、`qty`、退款与补发字段                   |
+| `cases`       | 售后单主表   | `type`、`status`、`qty`、退款与补发字段、`closed_at`（关闭时间） |
 | `attachments` | 图片凭证    | `scene`（apply / supplement）、`MEDIUMBLOB`         |
 | `inspections` | 收货与验货记录 | `received_at`、`result`、`issue_type`             |
-| `timeline`    | 操作时间线   | `role`、`actor`、`action`、`note`、`status_from/to` |
+| `timeline`    | 操作时间线   | `role`、`actor`、`action`、`note`、`status_from/to`、`visible_to_consumer` |
 
 关系：`orders 1—N order_items`，`order_items 1—N cases`，`cases 1—N attachments / timeline`，`cases 1—1 inspections`。
 
@@ -211,14 +214,17 @@ docker compose up -d --build
 
 ## 10. 验收场景
 
-6 条核心验收场景均已通过自动化测试（`npm test`，35 项检查）：
+9 条核心验收场景均已通过自动化测试（`npm test`，47 项检查）：
 
 1. 消费者能对本人已完成订单商品发起退货或换货；
 2. 超过可售后数量、重复申请、未完成订单被拒绝；
 3. 客服要求补充材料，买家补充后重新进入审核；
 4. 未经客服同意，仓库不能登记收货（不可见且不可操作）；
 5. 仓库验货异常后，客服继续处理并留下结论；
-6. 普通消费者不能查看他人订单与售后资料。
+6. 普通消费者不能查看他人订单与售后资料；
+7. 两个客服并发同意退回，只有一个成功，时间线只写一条；
+8. 仓库收货与验货记录仅内部可见，消费者拿不到验货明细；
+9. 进入终态写入 `closed_at`，工作台按关闭时间统计当日完成量。
 
 详细手工验收步骤与自动化测试输出见 [docs/验收测试记录.md](docs/验收测试记录.md)。
 
@@ -236,7 +242,7 @@ Clothes/
 │  ├─ index.html
 │  ├─ styles.css
 │  └─ app.js
-├─ test/acceptance.js        # 6 组核心验收场景自动化测试（独立测试库）
+├─ test/acceptance.js        # 9 组核心验收场景自动化测试（独立测试库）
 ├─ scripts/reset.js          # 重建演示数据库
 └─ docs/                     # 交付文档、Docker 部署说明与界面截图
 ```
@@ -251,5 +257,24 @@ Clothes/
 - **为什么写操作放进事务**：售后单、时间线、验货记录、凭证是强关联数据，中途失败会留下「有单没记录」的脏数据；`tx()` 保证原子性。
 - **为什么操作入口统一为 `/api/cases/:id/actions`**：所有状态流转、角色校验、必填原因、时间线留痕集中在一处，避免「前端能点但后端没拦住」。
 - **为什么由服务端返回 `availableActions`**：界面按钮与业务状态机同源，减少页面状态与后端规则不一致。
+- **为什么用状态条件更新而不是行锁**：`UPDATE ... WHERE id=? AND status=?` 把读到的状态当作版本号，不需要显式加锁，也不会出现「两个客服同时点同意，后一次覆盖前一次」；冲突直接返回 409 让前端刷新，比排队等锁更符合客服工作台的交互。
+- **为什么时间线要分内外**：仓库登记收货、验货是内部作业动作，包含包裹号、破损描述等不适合直接对买家展示的细节。用 `visible_to_consumer` 在服务端过滤，而不是前端隐藏，避免越权接口把内部备注带出去。
 - **图片凭证存 `MEDIUMBLOB`**：演示环境不引入对象存储，上传后由受权限保护的接口输出。
 - **已知限制**：会话存放在内存（重启需重新登录）；演示密码为固定值的 SHA-256 哈希；未做连接池之外的读写分离与缓存。
+
+## 13. 参考实现对照
+
+设计上参考了同选题的 Java 实现 [chos1nwp/clothing-aftersales](https://github.com/chos1nwp/clothing-aftersales)（Spring Boot + MyBatis + MySQL）。该仓库**未声明开源许可证**，因此这里只借鉴思路，代码按本项目的 Node.js 技术栈重写，没有复制源文件。
+
+| 参考实现的做法 | 是否采纳 | 在本项目的落地 |
+| --- | --- | --- |
+| 状态条件更新（`where id=? and status=?`）拦截并发 | 采纳 | `server.js` 执行操作时校验 `affectedRows`，为 0 抛 409；测试场景 7 用两个客服账号并发验证 |
+| 时间线区分内部记录与消费者可见记录 | 采纳 | `timeline.visible_to_consumer`，消费者查询时服务端过滤，验货明细整体不下发 |
+| `closed_at` 关闭时间 | 采纳 | 进入终态时写入，工作台「今日完成」按它统计 |
+| 按课程章节组织交付文档 | 部分采纳 | 已补 `docs/Docker部署说明.md` 与验收记录；章节化文档不重复建设 |
+| 统一响应封套 `{code,data,message}` | 不采纳 | 现有接口统一用 HTTP 状态码 + `{error}`，前端已适配；改造要动全部调用点，收益有限 |
+| 凭证存本地磁盘（UUID 重命名） | 不采纳 | 本项目凭证存 MySQL `MEDIUMBLOB`，容器化后无需挂载目录，备份只针对数据库 |
+| 收货不推进单据状态 | 不采纳 | 本项目把「已收货待验货」作为独立状态，语义等价，仓库工作台可直接按状态筛选 |
+| Java / Spring Boot 技术栈 | 不采纳 | 课程未限定语言，Node 版本已完成并通过全部测试，换栈没有额外收益 |
+
+> 参考仓库的其余工程实践（`@RequireRole` 注解、MyBatis XML 管理 SQL、脚本化验收）与本项目已有的 `requireRole()` 中间件、数据层封装、`test/acceptance.js` 属于同类做法，未重复引入。

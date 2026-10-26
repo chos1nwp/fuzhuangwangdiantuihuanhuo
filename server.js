@@ -27,6 +27,8 @@ const {
   ISSUE_TYPES,
   ROLE_LABEL,
   ACTIONS,
+  INTERNAL_ACTIONS,
+  TERMINAL_STATUS,
   SHIPPING_COMPANIES,
   DEFAULT_RETURN_ADDRESS,
 } = require('./db');
@@ -196,6 +198,7 @@ async function baseCase(row, user) {
     statusLabel: STATUS[row.status] || row.status,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    closedAt: row.closed_at,
     deadlineAt: dl.deadlineAt,
     overdue: dl.overdue,
     daysLeft: dl.daysLeft,
@@ -263,7 +266,11 @@ async function caseDetail(row, user) {
   }));
 
   const timelineRows = await all('SELECT * FROM timeline WHERE case_id = ? ORDER BY created_at, id', row.id);
-  const timeline = timelineRows.map((t) => ({
+  const isConsumer = user.role === 'consumer';
+  // 消费者只看对外记录：仓库收货、验货属于内部作业记录，不展示包裹号与内部备注
+  const visibleRows = timelineRows.filter((t) => !isConsumer || Number(t.visible_to_consumer) === 1);
+
+  const timeline = visibleRows.map((t) => ({
     id: t.id,
     role: t.role,
     roleLabel: ROLE_LABEL[t.role] || '系统',
@@ -273,25 +280,28 @@ async function caseDetail(row, user) {
     note: t.note,
     statusFrom: t.status_from,
     statusTo: t.status_to,
+    internal: Number(t.visible_to_consumer) === 0,
     createdAt: t.created_at,
   }));
 
   data.attachments = attachments;
   data.timeline = timeline;
-  data.inspection = insp
-    ? {
-        packageNo: insp.package_no,
-        receiveNote: insp.receive_note,
-        receivedAt: insp.received_at,
-        receivedBy: insp.received_by,
-        result: insp.result,
-        issueType: insp.issue_type,
-        issueTypeLabel: insp.issue_type ? ISSUE_TYPES[insp.issue_type] : null,
-        note: insp.inspect_note,
-        inspectedAt: insp.inspected_at,
-        inspectedBy: insp.inspected_by,
-      }
-    : null;
+  data.internalCount = timelineRows.length - visibleRows.length;
+  data.inspection =
+    !isConsumer && insp
+      ? {
+          packageNo: insp.package_no,
+          receiveNote: insp.receive_note,
+          receivedAt: insp.received_at,
+          receivedBy: insp.received_by,
+          result: insp.result,
+          issueType: insp.issue_type,
+          issueTypeLabel: insp.issue_type ? ISSUE_TYPES[insp.issue_type] : null,
+          note: insp.inspect_note,
+          inspectedAt: insp.inspected_at,
+          inspectedBy: insp.inspected_by,
+        }
+      : null;
 
   return data;
 }
@@ -780,12 +790,16 @@ async function createApp() {
     '/api/workbench',
     requireAuth,
     ah(async (req, res) => {
-      let rows = await all('SELECT status, type, updated_at FROM cases');
+      let rows = await all('SELECT status, type, updated_at, closed_at FROM cases');
       if (req.user.role === 'consumer') return res.status(403).json({ error: '当前岗位无需工作台' });
       if (req.user.role === 'warehouse') rows = rows.filter((r) => WAREHOUSE_VISIBLE.includes(r.status));
 
       const count = (list) => rows.filter((r) => list.includes(r.status)).length;
       const today = now().slice(0, 10);
+      const inspected = await get(
+        'SELECT COUNT(*) AS n FROM inspections WHERE inspected_at IS NOT NULL AND DATE(inspected_at) = ?',
+        today
+      );
 
       res.json({
         pendingReview: count(['pending_review']),
@@ -796,10 +810,8 @@ async function createApp() {
         issueCount: count(['inspect_issue']),
         toReceive: count(['awaiting_return', 'return_shipped']),
         toInspect: count(['received']),
-        inspectedToday: rows.filter(
-          (r) => (r.status === 'inspected' || r.status === 'inspect_issue') && (r.updated_at || '').slice(0, 10) === today
-        ).length,
-        completedToday: rows.filter((r) => r.status === 'completed' && (r.updated_at || '').slice(0, 10) === today)
+        inspectedToday: Number(inspected.n) || 0,
+        completedToday: rows.filter((r) => r.status === 'completed' && (r.closed_at || '').slice(0, 10) === today)
           .length,
       });
     })
@@ -954,13 +966,30 @@ async function createApp() {
         values.push(value);
       }
 
+      // 进入终态时记录关闭时间，供工作台统计与 SLA 分析使用
+      const closing = TERMINAL_STATUS.includes(result.status);
+      if (closing) {
+        sets.push('closed_at = ?');
+        values.push(ts);
+      }
+
       // 状态变更、时间线、验货记录、补充凭证在同一事务内完成
       await tx(async (t) => {
-        await t.run(`UPDATE cases SET ${sets.join(', ')} WHERE id = ?`, ...values, row.id);
+        // 乐观并发控制：把读到的状态当作版本条件，
+        // 两个客服同时点「同意退回」时只有一个能更新成功，另一个收到 409
+        const updated = await t.run(
+          `UPDATE cases SET ${sets.join(', ')} WHERE id = ? AND status = ?`,
+          ...values,
+          row.id,
+          row.status
+        );
+        if (updated.affectedRows === 0) {
+          throw new HttpError(409, '该售后单刚被其他人处理，请刷新后重试');
+        }
 
         await t.run(
-          `INSERT INTO timeline (case_id, role, actor, action, note, status_from, status_to, created_at)
-           VALUES (?,?,?,?,?,?,?,?)`,
+          `INSERT INTO timeline (case_id, role, actor, action, note, status_from, status_to, visible_to_consumer, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?)`,
           row.id,
           req.user.role,
           req.user.name,
@@ -968,6 +997,7 @@ async function createApp() {
           result.note,
           row.status,
           result.status,
+          INTERNAL_ACTIONS.has(result.action) ? 0 : 1,
           ts
         );
 
