@@ -46,6 +46,25 @@ DB_NAME=clothes_after_sale
 
 默认库名 `clothes_after_sale`，测试库为 `clothes_after_sale_test`，两者互不干扰。
 
+### 容器化运行（不用装 Node 和 MySQL）
+
+机器上只要装了 Docker，一条命令就能跑起来：
+
+```bash
+docker compose up -d --build
+# 打开 http://localhost:3000
+```
+
+| 命令 | 作用 |
+| --- | --- |
+| `docker compose up -d --build` | 构建并后台启动应用 + MySQL |
+| `docker compose ps` | 查看状态，两个服务都是 `healthy` 即就绪 |
+| `docker compose logs -f app` | 实时看应用日志 |
+| `docker compose down` | 停止并删除容器（数据保留） |
+| `docker compose down -v` | 连数据一起清空 |
+
+容器方式的数据库与本地 MySQL 完全隔离（映射到本机 `3307`），数据存在 Docker 卷 `clothes-mysql-data`。完整说明见 [docs/Docker部署说明.md](docs/Docker部署说明.md)，包含数据备份、镜像导出、推送到镜像仓库与常见问题。
+
 
 ## 2. 演示账号
 
@@ -210,19 +229,24 @@ Clothes/
 ├─ server.js                 # Express 服务、权限、状态机、REST 接口
 ├─ db.js                     # MySQL 连接池、建表、事务封装、模拟数据
 ├─ .env.example              # 数据库配置模板（复制为 .env）
+├─ Dockerfile                # 应用镜像：多阶段构建、非 root、健康检查
+├─ docker-compose.yml        # 应用 + MySQL 编排、数据卷、启动依赖
+├─ .dockerignore             # 排除 node_modules/.env，避免密码进镜像
 ├─ public/                   # 无构建步骤的前端单页应用
 │  ├─ index.html
 │  ├─ styles.css
 │  └─ app.js
 ├─ test/acceptance.js        # 6 组核心验收场景自动化测试（独立测试库）
 ├─ scripts/reset.js          # 重建演示数据库
-└─ docs/                     # 交付文档与界面截图
+└─ docs/                     # 交付文档、Docker 部署说明与界面截图
 ```
 
 ## 12. 设计取舍
 
 - **为什么用 MySQL**：课程要求关系型数据库，InnoDB 的外键、事务、索引与 `DECIMAL` 金额类型更贴近真实电商系统；同时为多实例部署留出空间。
-- **为什么库表由程序自动创建**：`npm start` 时检测并建库建表，评审者只需一个能连的 MySQL 账号，不用手动执行 SQL 脚本。
+- **为什么库表由程序自动创建**：`npm start` 时检测并建库建表，评审者只需一个能连的 MySQL 账号，不用手动执行 SQL 脚本。启动时先尝试直连目标库，库已存在就不需要建库权限，因此容器里可以只给业务账号。
+- **为什么容器拆成 app + mysql 两个**：数据库有状态、应用无状态，分开才能单独升级应用而保留数据；两者通过 compose 服务名互访，镜像里不放数据库，避免"数据跟着镜像走"。
+- **为什么镜像用多阶段构建**：构建阶段装依赖、运行阶段只留 `node_modules` 与源码，镜像更小；`.dockerignore` 排除 `.env`，数据库密码不会被打进镜像层。
 - **为什么查数据库统一走 `get / all / run` 三个封装**：`mysql2` 返回的 `[rows, fields]` 与 SQLite 风格不同，封装一层后业务代码只关心 SQL 与参数，事务里也能复用同一组方法。
 - **为什么写操作放进事务**：售后单、时间线、验货记录、凭证是强关联数据，中途失败会留下「有单没记录」的脏数据；`tx()` 保证原子性。
 - **为什么操作入口统一为 `/api/cases/:id/actions`**：所有状态流转、角色校验、必填原因、时间线留痕集中在一处，避免「前端能点但后端没拦住」。

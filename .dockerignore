@@ -1,0 +1,29 @@
+# 构建上下文排除清单：这些文件不需要进入镜像，排除后镜像更小、构建更快
+
+# 依赖与运行时数据（容器内用 npm ci 重新安装）
+node_modules
+data
+test/.tmp-*
+.shots
+
+# 敏感配置：数据库密码绝不能打进镜像
+.env
+.env.*
+!.env.example
+
+# 版本控制与工具元数据
+.git
+.gitignore
+.gitattributes
+.workbuddy
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# 文档、截图与容器相关文件本身
+README.md
+docs
+Dockerfile
+.dockerignore
+docker-compose*.yml

@@ -255,13 +255,21 @@ function bind(executor) {
 }
 
 /**
- * 初始化：建库 → 连接池 → 建表 → 首次写入模拟数据
- * 服务启动时调用一次。
+ * 确保目标数据库存在。
+ *
+ * 先带 database 直连：库已存在就直接返回，不需要任何建库权限
+ * （容器里通常只用被授权的业务账号，没有 CREATE DATABASE 权限）。
+ * 只有库确实不存在（ER_BAD_DB_ERROR）时，才用同一账号尝试建库。
  */
-async function init() {
-  if (pool) return pool;
+async function ensureDatabase() {
+  try {
+    const conn = await mysql.createConnection({ ...DB, charset: 'utf8mb4' });
+    await conn.end();
+    return;
+  } catch (err) {
+    if (err.code !== 'ER_BAD_DB_ERROR') throw err;
+  }
 
-  // 1. 先连到 MySQL 实例（不指定 database），确保目标库存在
   const admin = await mysql.createConnection({
     host: DB.host,
     port: DB.port,
@@ -276,6 +284,17 @@ async function init() {
   } finally {
     await admin.end();
   }
+}
+
+/**
+ * 初始化：建库 → 连接池 → 建表 → 首次写入模拟数据
+ * 服务启动时调用一次。
+ */
+async function init() {
+  if (pool) return pool;
+
+  // 1. 确保目标库存在（已存在时无需管理员权限）
+  await ensureDatabase();
 
   // 2. 连接池。dateStrings 让 DATETIME 以 'YYYY-MM-DD HH:MM:SS' 返回，
   //    decimalNumbers 让 DECIMAL 以数字返回，业务层无需再做转换。
