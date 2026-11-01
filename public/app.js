@@ -1850,126 +1850,200 @@ async function submitAction(c) {
    ========================================================================== */
 
 let chatPollTimer = null;
+const CHAT_POLL_INTERVAL = 3000; // 3秒轮询
 
 function startChatPolling() {
   if (chatPollTimer) return;
-  chatPollTimer = setInterval(async () => {
-    if (!state.user) return;
-    if (state.user.role !== 'consumer' && state.user.role !== 'service') return;
-    try {
-      const res = await api('/api/chat/unread');
-      state.chat.unread = res.count;
-      // 更新导航栏未读角标
-      const badge = qs('[data-count="chat"]');
-      if (badge) {
-        if (res.count > 0) {
-          badge.textContent = res.count;
-          badge.classList.remove('hidden');
-        } else {
-          badge.classList.add('hidden');
-        }
-      }
-
-      // 更新消费者悬浮按钮的未读红点
-      if (state.user.role === 'consumer') {
-        const fabBadge = qs('#chat-fab .chat-fab-badge');
-        if (fabBadge) {
-          if (res.count > 0) {
-            fabBadge.textContent = res.count;
-            fabBadge.classList.remove('hidden');
-          } else {
-            fabBadge.classList.add('hidden');
-          }
-        }
-      }
-
-      // 客服端：如果在消息中心页面，刷新会话列表
-      if (state.user.role === 'service' && location.hash === '#/chat') {
-        refreshChatConversations();
-      }
-
-      // 消费者端：如果聊天窗口打开，刷新消息
-      if (state.user.role === 'consumer' && state.chat.open && state.chat.activePeer) {
-        refreshChatMessages();
-      }
-
-      // 客服端：如果在消息中心且有活跃会话，刷新消息
-      if (state.user.role === 'service' && location.hash === '#/chat' && state.chat.activePeer) {
-        refreshChatCenterMessagesSilent();
-      }
-    } catch (e) { /* 忽略 */ }
-  }, 5000);
+  chatPollTimer = setInterval(chatPollTick, CHAT_POLL_INTERVAL);
+  // 立即执行一次
+  chatPollTick();
 }
 
-// 刷新会话列表（客服端消息中心）
-async function refreshChatConversations() {
+async function chatPollTick() {
+  if (!state.user) return;
+  if (state.user.role !== 'consumer' && state.user.role !== 'service') return;
+  try {
+    const res = await api('/api/chat/unread');
+    const oldTotal = state.chat.unread;
+    state.chat.unread = res.count;
+
+    // 更新所有未读角标
+    updateChatBadges(res.count);
+
+    // 有新消息时播放提示音（总数增加时）
+    if (res.count > oldTotal && oldTotal >= 0) {
+      playNotifySound();
+    }
+
+    // 客服端：如果在消息中心页面，增量刷新会话列表
+    if (state.user.role === 'service' && location.hash === '#/chat') {
+      refreshChatConversationsSmart();
+    }
+
+    // 如果聊天窗口/消息中心有活跃会话，增量拉取新消息
+    const chatOpen = (state.user.role === 'consumer' && state.chat.open) ||
+                     (state.user.role === 'service' && location.hash === '#/chat');
+    if (chatOpen && state.chat.activePeer) {
+      pollNewMessages();
+    }
+  } catch (e) { /* 忽略 */ }
+}
+
+// 更新所有未读角标
+function updateChatBadges(count) {
+  // 导航栏角标
+  const badge = qs('[data-count="chat"]');
+  if (badge) {
+    if (count > 0) {
+      badge.textContent = count;
+      badge.classList.remove('hidden');
+    } else {
+      badge.classList.add('hidden');
+    }
+  }
+  // 消费者悬浮按钮红点
+  if (state.user && state.user.role === 'consumer') {
+    const fabBadge = qs('#chat-fab .chat-fab-badge');
+    if (fabBadge) {
+      if (count > 0) {
+        fabBadge.textContent = count;
+        fabBadge.classList.remove('hidden');
+      } else {
+        fabBadge.classList.add('hidden');
+      }
+    }
+  }
+}
+
+// 播放新消息提示音（用 Web Audio API 生成简单提示音，无需音频文件）
+let audioCtx = null;
+function playNotifySound() {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.frequency.value = 800;
+    osc.type = 'sine';
+    gain.gain.setValueAtTime(0, audioCtx.currentTime);
+    gain.gain.linearRampToValueAtTime(0.1, audioCtx.currentTime + 0.02);
+    gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.15);
+    osc.start(audioCtx.currentTime);
+    osc.stop(audioCtx.currentTime + 0.15);
+  } catch (e) { /* 忽略音频错误 */ }
+}
+
+// 智能刷新会话列表（只在有变化时更新DOM，避免闪烁）
+async function refreshChatConversationsSmart() {
   try {
     const convs = await api('/api/chat/conversations');
-    const oldCount = state.chat.conversations.length;
+    const oldConvs = state.chat.conversations;
+
+    // 检查是否有变化
+    let changed = false;
+    if (oldConvs.length !== convs.length) {
+      changed = true;
+    } else {
+      for (let i = 0; i < convs.length; i++) {
+        const oldC = oldConvs[i];
+        const newC = convs[i];
+        if (oldC.peerId !== newC.peerId ||
+            oldC.lastMessage !== newC.lastMessage ||
+            oldC.unread !== newC.unread) {
+          changed = true;
+          break;
+        }
+      }
+    }
+
+    if (!changed) return; // 无变化，不更新DOM
+
     state.chat.conversations = convs;
+    renderChatConvList();
+  } catch (e) { /* 忽略 */ }
+}
 
-    // 更新会话列表 DOM
-    const listEl = qs('#chat-conv-items');
-    if (listEl) {
-      listEl.innerHTML = convs.length === 0 ? `<div class="chat-empty">暂无会话</div>` :
-        convs.map((c) => `
-          <div class="chat-conv-item ${c.peerId === state.chat.activePeer ? 'active' : ''}" data-peer="${c.peerId}">
-            <div class="chat-conv-avatar">${esc(c.peerName[0])}</div>
-            <div class="chat-conv-info">
-              <div class="chat-conv-name">
-                <span>${esc(c.peerName)}</span>
-                ${c.unread > 0 ? `<span class="chat-conv-unread">${c.unread}</span>` : ''}
-              </div>
-              <div class="chat-conv-last">${esc(c.lastMessage || '')}</div>
-            </div>
-            <div class="chat-conv-time">${fmtDT(c.lastTime)}</div>
+// 渲染会话列表（统一函数，避免重复代码）
+function renderChatConvList() {
+  const listEl = qs('#chat-conv-items');
+  if (!listEl) return;
+
+  const convs = state.chat.conversations;
+  listEl.innerHTML = convs.length === 0 ? `<div class="chat-empty">暂无会话</div>` :
+    convs.map((c) => `
+      <div class="chat-conv-item ${c.peerId === state.chat.activePeer ? 'active' : ''}" data-peer="${c.peerId}">
+        <div class="chat-conv-avatar ${c.peerRole === 'service' ? 'violet' : ''}">${esc(c.peerName[0])}</div>
+        <div class="chat-conv-info">
+          <div class="chat-conv-name">
+            <span>${esc(c.peerName)}</span>
+            ${c.unread > 0 ? `<span class="chat-conv-unread">${c.unread}</span>` : ''}
           </div>
-        `).join('');
+          <div class="chat-conv-last">${esc(c.lastMessage || '')}</div>
+        </div>
+        <div class="chat-conv-time">${fmtDT(c.lastTime)}</div>
+      </div>
+    `).join('');
 
-      // 重新绑定点击事件
-      qsa('.chat-conv-item').forEach((el) => {
-        el.addEventListener('click', async () => {
-          const peerId = Number(el.dataset.peer);
-          qsa('.chat-conv-item').forEach((e) => e.classList.remove('active'));
-          el.classList.add('active');
-          state.chat.activePeer = peerId;
-          await loadChatCenterMessages(peerId);
-        });
-      });
+  // 绑定点击事件
+  qsa('.chat-conv-item').forEach((el) => {
+    el.addEventListener('click', async () => {
+      const peerId = Number(el.dataset.peer);
+      qsa('.chat-conv-item').forEach((e) => e.classList.remove('active'));
+      el.classList.add('active');
+      state.chat.activePeer = peerId;
+      await loadChatCenterMessages(peerId);
+    });
+  });
+}
+
+// 增量拉取新消息
+async function pollNewMessages() {
+  if (!state.chat.activePeer) return;
+  try {
+    const lastMsgId = state.chat.messages.length > 0
+      ? state.chat.messages[state.chat.messages.length - 1].id
+      : 0;
+
+    const result = await api(`/api/chat/messages?peer=${state.chat.activePeer}&since_id=${lastMsgId}`);
+    const newMsgs = result.messages || [];
+
+    if (newMsgs.length > 0) {
+      // 追加到 state
+      state.chat.messages = state.chat.messages.concat(newMsgs);
+      appendChatMessages(newMsgs);
     }
   } catch (e) { /* 忽略 */ }
 }
 
-// 静默刷新客服端当前会话消息（不滚动到底部）
-async function refreshChatCenterMessagesSilent() {
-  if (!state.chat.activePeer) return;
-  try {
-    const messages = await api(`/api/chat/messages?peer=${state.chat.activePeer}`);
-    const oldLen = state.chat.messages.length;
-    state.chat.messages = messages;
+// 追加消息到聊天窗口
+function appendChatMessages(messages) {
+  const msgEl = qs('#chat-msg-list');
+  if (!msgEl) return;
 
-    if (messages.length > oldLen) {
-      const msgEl = qs('#chat-msg-list');
-      if (msgEl) {
-        const wasAtBottom = msgEl.scrollTop + msgEl.clientHeight >= msgEl.scrollHeight - 30;
-        // 只追加新消息
-        const newMsgs = messages.slice(oldLen);
-        newMsgs.forEach((m) => {
-          const div = document.createElement('div');
-          div.className = `chat-msg ${m.isMine ? 'mine' : 'theirs'}`;
-          div.innerHTML = `
-            ${!m.isMine ? `<div class="chat-msg-avatar">顾</div>` : ''}
-            <div class="chat-msg-bubble">${esc(m.content)}</div>
-            ${m.isMine ? `<div class="chat-msg-avatar mine violet">我</div>` : ''}
-          `;
-          msgEl.appendChild(div);
-        });
-        if (wasAtBottom) {
-          msgEl.scrollTop = msgEl.scrollHeight;
-        }
-      }
-    }
-  } catch (e) { /* 忽略 */ }
+  const wasAtBottom = msgEl.scrollTop + msgEl.clientHeight >= msgEl.scrollHeight - 30;
+
+  messages.forEach((m) => {
+    const div = document.createElement('div');
+    const avatarChar = m.isMine ? '我' : (getPeerFirstChar());
+    div.className = `chat-msg ${m.isMine ? 'mine' : 'theirs'}`;
+    div.innerHTML = `
+      ${!m.isMine ? `<div class="chat-msg-avatar ${m.senderId < 4 ? 'violet' : ''}">${avatarChar}</div>` : ''}
+      <div class="chat-msg-bubble">${esc(m.content)}</div>
+      ${m.isMine ? `<div class="chat-msg-avatar mine violet">我</div>` : ''}
+    `;
+    msgEl.appendChild(div);
+  });
+
+  if (wasAtBottom) {
+    msgEl.scrollTop = msgEl.scrollHeight;
+  }
+}
+
+// 获取对方名字首字
+function getPeerFirstChar() {
+  const conv = state.chat.conversations.find(c => c.peerId === state.chat.activePeer);
+  return conv ? conv.peerName[0] : '对';
 }
 
 function stopChatPolling() {
@@ -2084,24 +2158,12 @@ async function loadChatMessages(peerId) {
   const msgEl = qs('#chat-messages');
   if (!msgEl) return;
   try {
-    const messages = await api(`/api/chat/messages?peer=${peerId}`);
-    state.chat.messages = messages;
+    const result = await api(`/api/chat/messages?peer=${peerId}`);
+    state.chat.messages = result.messages || [];
     renderChatMessages();
   } catch (e) {
     msgEl.innerHTML = `<div class="chat-error">加载失败：${esc(e.message)}</div>`;
   }
-}
-
-async function refreshChatMessages() {
-  if (!state.chat.activePeer) return;
-  try {
-    const messages = await api(`/api/chat/messages?peer=${state.chat.activePeer}`);
-    const oldLen = state.chat.messages.length;
-    state.chat.messages = messages;
-    if (messages.length > oldLen) {
-      renderChatMessages();
-    }
-  } catch (e) { /* 忽略 */ }
 }
 
 function renderChatMessages() {
@@ -2141,6 +2203,8 @@ async function sendChatMessage() {
     });
     state.chat.messages.push(msg);
     renderChatMessages();
+    // 发送后立即触发一次轮询，更快收到回复
+    setTimeout(() => chatPollTick(), 1000);
   } catch (e) {
     toast(e.message, 'error');
   }
@@ -2166,21 +2230,6 @@ async function renderChatCenter() {
             <span class="chat-conv-count">${convs.length} 位</span>
           </div>
           <div class="chat-conv-items" id="chat-conv-items">
-            ${convs.length === 0 ? `<div class="chat-empty">暂无会话</div>` :
-              convs.map((c, i) => `
-                <div class="chat-conv-item ${i === 0 ? 'active' : ''}" data-peer="${c.peerId}">
-                  <div class="chat-conv-avatar">${esc(c.peerName[0])}</div>
-                  <div class="chat-conv-info">
-                    <div class="chat-conv-name">
-                      <span>${esc(c.peerName)}</span>
-                      ${c.unread > 0 ? `<span class="chat-conv-unread">${c.unread}</span>` : ''}
-                    </div>
-                    <div class="chat-conv-last">${esc(c.lastMessage || '')}</div>
-                  </div>
-                  <div class="chat-conv-time">${fmtDT(c.lastTime)}</div>
-                </div>
-              `).join('')
-            }
           </div>
         </div>
         <div class="chat-main" id="chat-main">
@@ -2194,20 +2243,12 @@ async function renderChatCenter() {
       </div>
     `;
 
+    // 渲染会话列表（用统一函数）
+    renderChatConvList();
+
     if (state.chat.activePeer) {
       await loadChatCenterMessages(state.chat.activePeer);
     }
-
-    // 绑定会话列表点击
-    qsa('.chat-conv-item').forEach((el) => {
-      el.addEventListener('click', async () => {
-        const peerId = Number(el.dataset.peer);
-        qsa('.chat-conv-item').forEach((e) => e.classList.remove('active'));
-        el.classList.add('active');
-        state.chat.activePeer = peerId;
-        await loadChatCenterMessages(peerId);
-      });
-    });
   } catch (e) {
     view.innerHTML = errorHTML(e);
   }
@@ -2240,8 +2281,8 @@ async function loadChatCenterMessages(peerId) {
   const msgEl = qs('#chat-msg-list');
   if (!msgEl) return;
   try {
-    const messages = await api(`/api/chat/messages?peer=${peerId}`);
-    state.chat.messages = messages;
+    const result = await api(`/api/chat/messages?peer=${peerId}`);
+    state.chat.messages = result.messages || [];
     renderChatCenterMessages();
     loadNavCounts();
   } catch (e) {
@@ -2257,13 +2298,17 @@ function renderChatCenterMessages() {
     msgEl.innerHTML = `<div class="chat-empty">暂无消息，发送第一条消息开始对话</div>`;
     return;
   }
-  msgEl.innerHTML = messages.map((m) => `
+  msgEl.innerHTML = messages.map((m) => {
+    const peer = state.chat.conversations.find(c => c.peerId === state.chat.activePeer);
+    const avatarChar = m.isMine ? '我' : (peer ? peer.peerName[0] : '顾');
+    return `
     <div class="chat-msg ${m.isMine ? 'mine' : 'theirs'}">
-      ${!m.isMine ? `<div class="chat-msg-avatar">${m.isMine ? '我' : '顾'}</div>` : ''}
+      ${!m.isMine ? `<div class="chat-msg-avatar">${avatarChar}</div>` : ''}
       <div class="chat-msg-bubble">${esc(m.content)}</div>
       ${m.isMine ? `<div class="chat-msg-avatar mine violet">我</div>` : ''}
     </div>
-  `).join('');
+  `;
+  }).join('');
   msgEl.scrollTop = msgEl.scrollHeight;
 }
 
@@ -2280,6 +2325,9 @@ async function sendChatCenterMessage() {
     });
     state.chat.messages.push(msg);
     renderChatCenterMessages();
+    // 发送后立即刷新会话列表和轮询
+    refreshChatConversationsSmart();
+    setTimeout(() => chatPollTick(), 1000);
   } catch (e) {
     toast(e.message, 'error');
   }

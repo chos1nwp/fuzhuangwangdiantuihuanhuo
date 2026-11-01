@@ -1132,6 +1132,7 @@ async function createApp() {
 
       const userId = req.user.id;
       const role = req.user.role;
+      const sinceId = Number(req.query.since_id) || 0;
 
       const peer = await get('SELECT id, role FROM users WHERE id = ?', peerId);
       if (!peer) throw new HttpError(404, '对话对象不存在');
@@ -1147,30 +1148,44 @@ async function createApp() {
       const consumerId = role === 'consumer' ? userId : peerId;
       const serviceId = role === 'service' ? userId : peerId;
 
-      // 标记对方发来的消息为已读
-      await run(
-        'UPDATE chat_messages SET is_read = 1 WHERE consumer_id = ? AND service_id = ? AND sender_id = ? AND is_read = 0',
-        consumerId, serviceId, peerId
-      );
+      // 标记对方发来的消息为已读（只标记已收到的，即 since_id 之前的）
+      if (sinceId > 0) {
+        await run(
+          'UPDATE chat_messages SET is_read = 1 WHERE consumer_id = ? AND service_id = ? AND sender_id = ? AND is_read = 0 AND id <= ?',
+          consumerId, serviceId, peerId, sinceId
+        );
+      } else {
+        await run(
+          'UPDATE chat_messages SET is_read = 1 WHERE consumer_id = ? AND service_id = ? AND sender_id = ? AND is_read = 0',
+          consumerId, serviceId, peerId
+        );
+      }
 
-      const messages = await all(
-        `SELECT id, sender_id, content, is_read, created_at
-         FROM chat_messages
-         WHERE consumer_id = ? AND service_id = ?
-         ORDER BY id ASC`,
-        consumerId, serviceId
-      );
+      let sql = `SELECT id, sender_id, content, is_read, created_at
+                 FROM chat_messages
+                 WHERE consumer_id = ? AND service_id = ?`;
+      const params = [consumerId, serviceId];
 
-      res.json(
-        messages.map((m) => ({
+      if (sinceId > 0) {
+        sql += ' AND id > ?';
+        params.push(sinceId);
+      }
+
+      sql += ' ORDER BY id ASC';
+
+      const messages = await all(sql, ...params);
+
+      res.json({
+        messages: messages.map((m) => ({
           id: m.id,
           senderId: m.sender_id,
           isMine: m.sender_id === userId,
           content: m.content,
           isRead: Number(m.is_read) === 1,
           createdAt: m.created_at,
-        }))
-      );
+        })),
+        isIncremental: sinceId > 0,
+      });
     })
   );
 
