@@ -1062,6 +1062,514 @@ async function createApp() {
 
   app.get('/api/health', (req, res) => res.json({ ok: true, time: now() }));
 
+  /* ---------------- 聊天功能 ---------------- */
+
+  // 获取会话列表
+  app.get(
+    '/api/chat/conversations',
+    requireAuth,
+    ah(async (req, res) => {
+      const userId = req.user.id;
+      const role = req.user.role;
+
+      let rows;
+      if (role === 'consumer') {
+        // 消费者：查看与哪些客服聊过天
+        rows = await all(
+          `SELECT m.service_id AS peer_id, u.name AS peer_name, u.role AS peer_role,
+            (SELECT content FROM chat_messages m2 WHERE (m2.consumer_id = ? AND m2.service_id = m.service_id)
+             ORDER BY m2.id DESC LIMIT 1) AS last_message,
+            (SELECT created_at FROM chat_messages m2 WHERE (m2.consumer_id = ? AND m2.service_id = m.service_id)
+             ORDER BY m2.id DESC LIMIT 1) AS last_time,
+            SUM(CASE WHEN m.is_read = 0 AND m.sender_id != ? THEN 1 ELSE 0 END) AS unread
+           FROM chat_messages m
+           JOIN users u ON u.id = m.service_id
+           WHERE m.consumer_id = ?
+           GROUP BY m.service_id, u.name, u.role
+           ORDER BY last_time DESC`,
+          userId, userId, userId, userId
+        );
+      } else if (role === 'service') {
+        // 客服：查看与哪些消费者聊过天
+        rows = await all(
+          `SELECT m.consumer_id AS peer_id, u.name AS peer_name, u.role AS peer_role,
+            (SELECT content FROM chat_messages m2 WHERE (m2.service_id = ? AND m2.consumer_id = m.consumer_id)
+             ORDER BY m2.id DESC LIMIT 1) AS last_message,
+            (SELECT created_at FROM chat_messages m2 WHERE (m2.service_id = ? AND m2.consumer_id = m.consumer_id)
+             ORDER BY m2.id DESC LIMIT 1) AS last_time,
+            SUM(CASE WHEN m.is_read = 0 AND m.sender_id != ? THEN 1 ELSE 0 END) AS unread
+           FROM chat_messages m
+           JOIN users u ON u.id = m.consumer_id
+           WHERE m.service_id = ?
+           GROUP BY m.consumer_id, u.name, u.role
+           ORDER BY last_time DESC`,
+          userId, userId, userId, userId
+        );
+      } else {
+        return res.status(403).json({ error: '当前岗位无需聊天功能' });
+      }
+
+      res.json(
+        rows.map((r) => ({
+          peerId: r.peer_id,
+          peerName: r.peer_name,
+          peerRole: r.peer_role,
+          lastMessage: r.last_message,
+          lastTime: r.last_time,
+          unread: Number(r.unread),
+        }))
+      );
+    })
+  );
+
+  // 获取与某用户的聊天消息
+  app.get(
+    '/api/chat/messages',
+    requireAuth,
+    ah(async (req, res) => {
+      const peerId = Number(req.query.peer);
+      if (!peerId) throw new HttpError(400, '请指定对话对象');
+
+      const userId = req.user.id;
+      const role = req.user.role;
+
+      const peer = await get('SELECT id, role FROM users WHERE id = ?', peerId);
+      if (!peer) throw new HttpError(404, '对话对象不存在');
+
+      // 权限校验：消费者只能和客服聊，客服只能和消费者聊
+      if (role === 'consumer' && peer.role !== 'service') {
+        throw new HttpError(403, '只能与客服对话');
+      }
+      if (role === 'service' && peer.role !== 'consumer') {
+        throw new HttpError(403, '只能与消费者对话');
+      }
+
+      const consumerId = role === 'consumer' ? userId : peerId;
+      const serviceId = role === 'service' ? userId : peerId;
+
+      // 标记对方发来的消息为已读
+      await run(
+        'UPDATE chat_messages SET is_read = 1 WHERE consumer_id = ? AND service_id = ? AND sender_id = ? AND is_read = 0',
+        consumerId, serviceId, peerId
+      );
+
+      const messages = await all(
+        `SELECT id, sender_id, content, is_read, created_at
+         FROM chat_messages
+         WHERE consumer_id = ? AND service_id = ?
+         ORDER BY id ASC`,
+        consumerId, serviceId
+      );
+
+      res.json(
+        messages.map((m) => ({
+          id: m.id,
+          senderId: m.sender_id,
+          isMine: m.sender_id === userId,
+          content: m.content,
+          isRead: Number(m.is_read) === 1,
+          createdAt: m.created_at,
+        }))
+      );
+    })
+  );
+
+  // 发送消息
+  app.post(
+    '/api/chat/messages',
+    requireAuth,
+    ah(async (req, res) => {
+      const peerId = Number(req.body && req.body.peerId);
+      const content = trim(req.body && req.body.content);
+      if (!peerId) throw new HttpError(400, '请指定对话对象');
+      if (!content) throw new HttpError(400, '消息内容不能为空');
+      if (content.length > 2000) throw new HttpError(400, '消息不能超过 2000 字');
+
+      const userId = req.user.id;
+      const role = req.user.role;
+
+      const peer = await get('SELECT id, role FROM users WHERE id = ?', peerId);
+      if (!peer) throw new HttpError(404, '对话对象不存在');
+
+      if (role === 'consumer' && peer.role !== 'service') {
+        throw new HttpError(403, '只能与客服对话');
+      }
+      if (role === 'service' && peer.role !== 'consumer') {
+        throw new HttpError(403, '只能与消费者对话');
+      }
+
+      const consumerId = role === 'consumer' ? userId : peerId;
+      const serviceId = role === 'service' ? userId : peerId;
+      const ts = now();
+
+      const result = await run(
+        'INSERT INTO chat_messages (consumer_id, service_id, sender_id, content, is_read, created_at) VALUES (?,?,?,?,0,?)',
+        consumerId, serviceId, userId, content, ts
+      );
+
+      res.status(201).json({
+        id: result.insertId,
+        senderId: userId,
+        isMine: true,
+        content,
+        isRead: false,
+        createdAt: ts,
+      });
+    })
+  );
+
+  // 获取未读消息总数
+  app.get(
+    '/api/chat/unread',
+    requireAuth,
+    ah(async (req, res) => {
+      const userId = req.user.id;
+      const role = req.user.role;
+      if (role !== 'consumer' && role !== 'service') {
+        return res.json({ count: 0 });
+      }
+      const row = await get(
+        'SELECT COUNT(*) AS n FROM chat_messages WHERE sender_id != ? AND is_read = 0 AND ' +
+          (role === 'consumer' ? 'consumer_id = ?' : 'service_id = ?'),
+        userId, userId
+      );
+      res.json({ count: Number(row.n) });
+    })
+  );
+
+  // 获取客服列表（消费者发起新对话时选择）
+  app.get(
+    '/api/chat/service-list',
+    requireRole('consumer'),
+    ah(async (req, res) => {
+      const rows = await all(
+        "SELECT id, name, phone, title FROM users WHERE role = 'service' ORDER BY id"
+      );
+      res.json(
+        rows.map((r) => ({
+          id: r.id,
+          name: r.name,
+          title: r.title,
+        }))
+      );
+    })
+  );
+
+  /* ---------------- 库存管理（仓库端） ---------------- */
+
+  // 库存列表
+  app.get(
+    '/api/inventory',
+    requireRole('warehouse'),
+    ah(async (req, res) => {
+      const keyword = trim(req.query.q || '').toLowerCase();
+      const lowStock = req.query.low === '1';
+
+      let sql = 'SELECT * FROM inventory WHERE 1=1';
+      const params = [];
+
+      if (keyword) {
+        sql += ' AND (LOWER(sku_no) LIKE ? OR LOWER(title) LIKE ? OR LOWER(color) LIKE ? OR LOWER(size) LIKE ?)';
+        const like = `%${keyword}%`;
+        params.push(like, like, like, like);
+      }
+
+      if (lowStock) {
+        sql += ' AND stock_qty < standard_qty';
+      }
+
+      sql += ' ORDER BY stock_qty < standard_qty DESC, sku_no ASC, size ASC';
+
+      const rows = await all(sql, ...params);
+      res.json(
+        rows.map((r) => ({
+          id: r.id,
+          sku: r.sku_no,
+          title: r.title,
+          color: r.color,
+          size: r.size,
+          stockQty: r.stock_qty,
+          standardQty: r.standard_qty,
+          location: r.location,
+          updatedAt: r.updated_at,
+          isLow: r.stock_qty < r.standard_qty,
+          shortage: Math.max(0, r.standard_qty - r.stock_qty),
+        }))
+      );
+    })
+  );
+
+  // 设置标准库存量
+  app.put(
+    '/api/inventory/:id',
+    requireRole('warehouse'),
+    ah(async (req, res) => {
+      const id = Number(req.params.id);
+      const standardQty = Number(req.body && req.body.standardQty);
+
+      if (!Number.isInteger(standardQty) || standardQty < 0) {
+        throw new HttpError(400, '标准库存量必须是大于等于 0 的整数');
+      }
+
+      const exist = await get('SELECT id FROM inventory WHERE id = ?', id);
+      if (!exist) throw new HttpError(404, '库存记录不存在');
+
+      const ts = now();
+      await run(
+        'UPDATE inventory SET standard_qty = ?, updated_at = ? WHERE id = ?',
+        standardQty, ts, id
+      );
+
+      const updated = await get('SELECT * FROM inventory WHERE id = ?', id);
+      res.json({
+        id: updated.id,
+        sku: updated.sku_no,
+        title: updated.title,
+        color: updated.color,
+        size: updated.size,
+        stockQty: updated.stock_qty,
+        standardQty: updated.standard_qty,
+        location: updated.location,
+        updatedAt: updated.updated_at,
+        isLow: updated.stock_qty < updated.standard_qty,
+        shortage: Math.max(0, updated.standard_qty - updated.stock_qty),
+      });
+    })
+  );
+
+  // 库存预警统计
+  app.get(
+    '/api/inventory/alerts',
+    requireRole('warehouse'),
+    ah(async (req, res) => {
+      const row = await get(
+        'SELECT COUNT(*) AS n FROM inventory WHERE stock_qty < standard_qty'
+      );
+      const total = await get('SELECT COUNT(*) AS n FROM inventory');
+      const shortageRow = await get(
+        'SELECT COALESCE(SUM(standard_qty - stock_qty), 0) AS s FROM inventory WHERE stock_qty < standard_qty'
+      );
+      res.json({
+        lowStockCount: Number(row.n),
+        totalCount: Number(total.n),
+        totalShortage: Number(shortageRow.s),
+      });
+    })
+  );
+
+  // 调整库存（入库/出库）
+  app.post(
+    '/api/inventory/:id/adjust',
+    requireRole('warehouse'),
+    ah(async (req, res) => {
+      const id = Number(req.params.id);
+      const delta = Number(req.body && req.body.delta);
+      const note = optionalText(req.body && req.body.note, 200);
+
+      if (!Number.isInteger(delta) || delta === 0) {
+        throw new HttpError(400, '调整数量必须是非零整数');
+      }
+
+      const exist = await get('SELECT * FROM inventory WHERE id = ?', id);
+      if (!exist) throw new HttpError(404, '库存记录不存在');
+
+      const newQty = exist.stock_qty + delta;
+      if (newQty < 0) throw new HttpError(400, '库存数量不能为负数');
+
+      const ts = now();
+      await run(
+        'UPDATE inventory SET stock_qty = ?, updated_at = ? WHERE id = ?',
+        newQty, ts, id
+      );
+
+      const updated = await get('SELECT * FROM inventory WHERE id = ?', id);
+      res.json({
+        id: updated.id,
+        sku: updated.sku_no,
+        title: updated.title,
+        color: updated.color,
+        size: updated.size,
+        stockQty: updated.stock_qty,
+        standardQty: updated.standard_qty,
+        location: updated.location,
+        updatedAt: updated.updated_at,
+        isLow: updated.stock_qty < updated.standard_qty,
+        shortage: Math.max(0, updated.standard_qty - updated.stock_qty),
+      });
+    })
+  );
+
+  /* ---------------- 补货申请 ---------------- */
+
+  // 补货列表
+  app.get(
+    '/api/replenishments',
+    requireRole('warehouse'),
+    ah(async (req, res) => {
+      const status = req.query.status;
+      let sql = `SELECT r.*, u.name AS creator_name
+                 FROM replenishments r
+                 JOIN users u ON u.id = r.created_by
+                 WHERE 1=1`;
+      const params = [];
+
+      if (status && status !== 'all') {
+        sql += ' AND r.status = ?';
+        params.push(status);
+      }
+
+      sql += ' ORDER BY r.created_at DESC';
+
+      const rows = await all(sql, ...params);
+      res.json(
+        rows.map((r) => ({
+          id: r.id,
+          inventoryId: r.inventory_id,
+          sku: r.sku_no,
+          title: r.title,
+          color: r.color,
+          size: r.size,
+          qty: r.qty,
+          supplier: r.supplier,
+          status: r.status,
+          note: r.note,
+          creatorName: r.creator_name,
+          createdAt: r.created_at,
+          shippedAt: r.shipped_at,
+          receivedAt: r.received_at,
+        }))
+      );
+    })
+  );
+
+  // 创建补货申请
+  app.post(
+    '/api/replenishments',
+    requireRole('warehouse'),
+    ah(async (req, res) => {
+      const inventoryId = Number(req.body && req.body.inventoryId);
+      const qty = Number(req.body && req.body.qty);
+      const supplier = optionalText(req.body && req.body.supplier, 80);
+      const note = optionalText(req.body && req.body.note, 500);
+
+      if (!inventoryId) throw new HttpError(400, '请选择库存商品');
+      if (!Number.isInteger(qty) || qty <= 0) {
+        throw new HttpError(400, '补货数量必须是大于 0 的整数');
+      }
+
+      const inv = await get('SELECT * FROM inventory WHERE id = ?', inventoryId);
+      if (!inv) throw new HttpError(404, '库存商品不存在');
+
+      const ts = now();
+      const result = await run(
+        `INSERT INTO replenishments
+         (inventory_id, sku_no, title, color, size, qty, supplier, status, note, created_by, created_at)
+         VALUES (?,?,?,?,?,?,?,'pending',?,?,?)`,
+        inv.id, inv.sku_no, inv.title, inv.color, inv.size,
+        qty, supplier, note, req.user.id, ts
+      );
+
+      res.status(201).json({
+        id: result.insertId,
+        inventoryId: inv.id,
+        sku: inv.sku_no,
+        title: inv.title,
+        color: inv.color,
+        size: inv.size,
+        qty,
+        supplier,
+        status: 'pending',
+        note,
+        creatorName: req.user.name,
+        createdAt: ts,
+      });
+    })
+  );
+
+  // 更新补货状态（发货/收货/取消）
+  app.put(
+    '/api/replenishments/:id/status',
+    requireRole('warehouse'),
+    ah(async (req, res) => {
+      const id = Number(req.params.id);
+      const action = trim(req.body && req.body.action);
+
+      const exist = await get('SELECT * FROM replenishments WHERE id = ?', id);
+      if (!exist) throw new HttpError(404, '补货申请不存在');
+
+      const ts = now();
+
+      if (action === 'ship') {
+        if (exist.status !== 'pending') throw new HttpError(400, '只有待处理状态的补货才能标记发货');
+        await run(
+          "UPDATE replenishments SET status = 'shipped', shipped_at = ? WHERE id = ?",
+          ts, id
+        );
+      } else if (action === 'receive') {
+        if (exist.status !== 'shipped') throw new HttpError(400, '只有运输中的补货才能确认收货');
+        // 收货：增加库存
+        await run(
+          "UPDATE replenishments SET status = 'received', received_at = ? WHERE id = ?",
+          ts, id
+        );
+        await run(
+          'UPDATE inventory SET stock_qty = stock_qty + ?, updated_at = ? WHERE id = ?',
+          exist.qty, ts, exist.inventory_id
+        );
+      } else if (action === 'cancel') {
+        if (exist.status !== 'pending') throw new HttpError(400, '只有待处理状态的补货才能取消');
+        await run(
+          "UPDATE replenishments SET status = 'cancelled' WHERE id = ?",
+          id
+        );
+      } else {
+        throw new HttpError(400, '无效的操作');
+      }
+
+      const updated = await get(
+        `SELECT r.*, u.name AS creator_name
+         FROM replenishments r JOIN users u ON u.id = r.created_by
+         WHERE r.id = ?`,
+        id
+      );
+      res.json({
+        id: updated.id,
+        inventoryId: updated.inventory_id,
+        sku: updated.sku_no,
+        title: updated.title,
+        color: updated.color,
+        size: updated.size,
+        qty: updated.qty,
+        supplier: updated.supplier,
+        status: updated.status,
+        note: updated.note,
+        creatorName: updated.creator_name,
+        createdAt: updated.created_at,
+        shippedAt: updated.shipped_at,
+        receivedAt: updated.received_at,
+      });
+    })
+  );
+
+  // 补货统计
+  app.get(
+    '/api/replenishments/stats',
+    requireRole('warehouse'),
+    ah(async (req, res) => {
+      const pendingRow = await get("SELECT COUNT(*) AS n FROM replenishments WHERE status = 'pending'");
+      const shippedRow = await get("SELECT COUNT(*) AS n FROM replenishments WHERE status = 'shipped'");
+      const totalRow = await get('SELECT COUNT(*) AS n FROM replenishments');
+      const qtyRow = await get("SELECT COALESCE(SUM(qty), 0) AS s FROM replenishments WHERE status = 'pending'");
+
+      res.json({
+        pending: Number(pendingRow.n),
+        shipped: Number(shippedRow.n),
+        total: Number(totalRow.n),
+        pendingQty: Number(qtyRow.s),
+      });
+    })
+  );
+
   /* ---------------- 静态资源 ---------------- */
 
   app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));

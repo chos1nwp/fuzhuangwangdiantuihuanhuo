@@ -240,6 +240,61 @@ const SCHEMA = [
      KEY idx_timeline_case (case_id),
      CONSTRAINT fk_timeline_case FOREIGN KEY (case_id) REFERENCES cases (id)
    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+  `CREATE TABLE IF NOT EXISTS chat_messages (
+     id           INT UNSIGNED NOT NULL AUTO_INCREMENT,
+     consumer_id  INT UNSIGNED NOT NULL,
+     service_id   INT UNSIGNED NOT NULL,
+     sender_id    INT UNSIGNED NOT NULL,
+     content      TEXT         NOT NULL,
+     is_read      TINYINT(1)   NOT NULL DEFAULT 0,
+     created_at   DATETIME     NOT NULL,
+     PRIMARY KEY (id),
+     KEY idx_chat_consumer (consumer_id),
+     KEY idx_chat_service (service_id),
+     KEY idx_chat_created (created_at),
+     CONSTRAINT fk_chat_consumer FOREIGN KEY (consumer_id) REFERENCES users (id),
+     CONSTRAINT fk_chat_service FOREIGN KEY (service_id) REFERENCES users (id),
+     CONSTRAINT fk_chat_sender FOREIGN KEY (sender_id) REFERENCES users (id)
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+  `CREATE TABLE IF NOT EXISTS inventory (
+     id            INT UNSIGNED NOT NULL AUTO_INCREMENT,
+     sku_no        VARCHAR(40)  NOT NULL,
+     title         VARCHAR(120) NOT NULL,
+     color         VARCHAR(30)  NOT NULL,
+     size          VARCHAR(20)  NOT NULL,
+     stock_qty     INT          NOT NULL DEFAULT 0 COMMENT '当前库存数量',
+     standard_qty  INT          NOT NULL DEFAULT 0 COMMENT '标准库存量，低于此值触发补货提醒',
+     location      VARCHAR(60)  DEFAULT NULL COMMENT '库位',
+     updated_at    DATETIME     NOT NULL,
+     PRIMARY KEY (id),
+     UNIQUE KEY uk_inventory_sku (sku_no, color, size),
+     KEY idx_inventory_stock (stock_qty)
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+  `CREATE TABLE IF NOT EXISTS replenishments (
+     id             INT UNSIGNED NOT NULL AUTO_INCREMENT,
+     inventory_id   INT UNSIGNED NOT NULL,
+     sku_no         VARCHAR(40)  NOT NULL,
+     title          VARCHAR(120) NOT NULL,
+     color          VARCHAR(30)  NOT NULL,
+     size           VARCHAR(20)  NOT NULL,
+     qty            INT          NOT NULL COMMENT '补货数量',
+     supplier       VARCHAR(80)  DEFAULT NULL COMMENT '供应商/厂家',
+     status         VARCHAR(20)  NOT NULL DEFAULT 'pending' COMMENT 'pending/shipped/received/cancelled',
+     note           TEXT,
+     created_by     INT UNSIGNED NOT NULL,
+     created_at     DATETIME     NOT NULL,
+     shipped_at     DATETIME     DEFAULT NULL,
+     received_at    DATETIME     DEFAULT NULL,
+     PRIMARY KEY (id),
+     KEY idx_repl_inventory (inventory_id),
+     KEY idx_repl_status (status),
+     KEY idx_repl_created (created_at),
+     CONSTRAINT fk_repl_inventory FOREIGN KEY (inventory_id) REFERENCES inventory (id),
+     CONSTRAINT fk_repl_creator FOREIGN KEY (created_by) REFERENCES users (id)
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 ];
 
 /* ------------------------------------------------------------------ */
@@ -808,6 +863,116 @@ async function seed() {
            VALUES (?,?,?,?,?,?,?,?,?,?)`,
           cid,
           ...c.inspection
+        );
+      }
+    }
+
+    // 库存数据
+    const inventoryItems = [
+      ['SKU-SH-2201', '经典牛津纺宽松衬衫', '燕麦白', 'S', 45, 50, 'A-01-01'],
+      ['SKU-SH-2201', '经典牛津纺宽松衬衫', '燕麦白', 'M', 32, 50, 'A-01-02'],
+      ['SKU-SH-2201', '经典牛津纺宽松衬衫', '燕麦白', 'L', 8, 50, 'A-01-03'],
+      ['SKU-SH-2201', '经典牛津纺宽松衬衫', '燕麦白', 'XL', 56, 40, 'A-01-04'],
+      ['SKU-JN-1180', '高腰直筒牛仔裤', '深蓝', 'S', 28, 30, 'B-02-01'],
+      ['SKU-JN-1180', '高腰直筒牛仔裤', '深蓝', 'M', 35, 30, 'B-02-02'],
+      ['SKU-JN-1180', '高腰直筒牛仔裤', '深蓝', 'L', 12, 30, 'B-02-03'],
+      ['SKU-TS-3301', '重磅纯棉短袖 T 恤', '白色', 'M', 120, 100, 'C-03-01'],
+      ['SKU-TS-3301', '重磅纯棉短袖 T 恤', '白色', 'L', 98, 100, 'C-03-02'],
+      ['SKU-TS-1002', '基础款纯棉 T 恤', '白色', 'M', 3, 50, 'C-04-01'],
+      ['SKU-TS-1002', '基础款纯棉 T 恤', '白色', 'L', 60, 50, 'C-04-02'],
+      ['SKU-HD-3320', '落肩廓形卫衣', '雾灰', 'M', 22, 25, 'D-05-01'],
+      ['SKU-HD-3320', '落肩廓形卫衣', '雾灰', 'L', 18, 25, 'D-05-02'],
+      ['SKU-HD-3320', '落肩廓形卫衣', '雾灰', 'XL', 5, 20, 'D-05-03'],
+      ['SKU-BZ-9010', '羊毛混纺西装外套', '炭灰', 'M', 15, 20, 'E-06-01'],
+      ['SKU-BZ-9010', '羊毛混纺西装外套', '炭灰', 'L', 25, 20, 'E-06-02'],
+      ['SKU-PT-5501', '垂感阔腿休闲西裤', '黑色', 'S', 30, 25, 'F-07-01'],
+      ['SKU-PT-5501', '垂感阔腿休闲西裤', '黑色', 'M', 28, 25, 'F-07-02'],
+      ['SKU-KN-4402', '细针针织开衫', '奶油白', 'S', 40, 30, 'G-08-01'],
+      ['SKU-DR-6608', '法式碎花连衣裙', '杏色', 'M', 10, 20, 'H-09-01'],
+      ['SKU-CT-7702', '轻薄防晒外套', '浅灰', 'L', 8, 15, 'I-10-01'],
+    ];
+    for (const inv of inventoryItems) {
+      await t.run(
+        'INSERT INTO inventory (sku_no, title, color, size, stock_qty, standard_qty, location, updated_at) VALUES (?,?,?,?,?,?,?,?)',
+        inv[0], inv[1], inv[2], inv[3], inv[4], inv[5], inv[6], base
+      );
+    }
+
+    // 补货申请种子数据
+    const whUserId = uid['13700000001']; // 王建国
+    const pad = (n) => String(n).padStart(2, '0');
+    const fmt = (d) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    const baseDate = new Date(base.replace(' ', 'T'));
+
+    const replenishments = [
+      { skuIdx: 2, qty: 50, supplier: '上海锦泓制衣有限公司', status: 'pending', note: '尺码L库存不足，紧急补货', daysAgo: 1 },
+      { skuIdx: 9, qty: 80, supplier: '宁波恒远针织厂', status: 'shipped', note: '基础款T恤 M码长期缺货', daysAgo: 3 },
+      { skuIdx: 12, qty: 30, supplier: '杭州优品服饰', status: 'received', note: '卫衣XL码补货', daysAgo: 7 },
+      { skuIdx: 19, qty: 25, supplier: '苏州韵致女装', status: 'pending', note: '碎花连衣裙M码', daysAgo: 0 },
+    ];
+
+    for (const repl of replenishments) {
+      const invItem = inventoryItems[repl.skuIdx];
+      const invRow = await t.get(
+        'SELECT id FROM inventory WHERE sku_no = ? AND color = ? AND size = ?',
+        invItem[0], invItem[2], invItem[3]
+      );
+      const createTime = fmt(new Date(baseDate.getTime() - repl.daysAgo * 86400000));
+      const shippedAt = (repl.status === 'shipped' || repl.status === 'received')
+        ? fmt(new Date(baseDate.getTime() - (repl.daysAgo - 1) * 86400000))
+        : null;
+      const receivedAt = repl.status === 'received'
+        ? fmt(new Date(baseDate.getTime() - (repl.daysAgo - 3) * 86400000))
+        : null;
+
+      await t.run(
+        `INSERT INTO replenishments
+         (inventory_id, sku_no, title, color, size, qty, supplier, status, note, created_by, created_at, shipped_at, received_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        invRow.id, invItem[0], invItem[1], invItem[2], invItem[3],
+        repl.qty, repl.supplier, repl.status, repl.note,
+        whUserId, createTime, shippedAt, receivedAt
+      );
+
+      // 如果已收货，增加库存
+      if (repl.status === 'received') {
+        await t.run(
+          'UPDATE inventory SET stock_qty = stock_qty + ?, updated_at = ? WHERE id = ?',
+          repl.qty, receivedAt, invRow.id
+        );
+      }
+    }
+
+    // 聊天消息种子数据
+    const chatSeeds = [
+      {
+        consumer: '13800000001',
+        service: '13900000001',
+        messages: [
+          { from: 'consumer', content: '你好，我想咨询一下退换货流程', time: '2026-10-15 10:20:00', read: 1 },
+          { from: 'service', content: '您好！请问有什么可以帮您的？', time: '2026-10-15 10:21:30', read: 1 },
+          { from: 'consumer', content: '我那件衬衫袖口有点问题，想申请退货', time: '2026-10-15 10:22:00', read: 1 },
+          { from: 'service', content: '好的，您可以在订单详情页点击"申请售后"，选择退货退款并上传凭证图片，客服会在24小时内审核。', time: '2026-10-15 10:23:00', read: 1 },
+          { from: 'consumer', content: '好的，谢谢！', time: '2026-10-15 10:24:00', read: 1 },
+        ],
+      },
+      {
+        consumer: '13800000002',
+        service: '13900000002',
+        messages: [
+          { from: 'consumer', content: '在吗？我的换货申请什么时候能处理？', time: '2026-10-18 14:30:00', read: 1 },
+          { from: 'service', content: '您好，您的换货申请已经审核通过了，商品寄回后我们会尽快安排补发。', time: '2026-10-18 14:32:00', read: 1 },
+          { from: 'consumer', content: '我已经寄出去了，中通快递 753128904561', time: '2026-10-18 14:35:00', read: 0 },
+        ],
+      },
+    ];
+    for (const chat of chatSeeds) {
+      const cid = uid[chat.consumer];
+      const sid = uid[chat.service];
+      for (const msg of chat.messages) {
+        await t.run(
+          'INSERT INTO chat_messages (consumer_id, service_id, sender_id, content, is_read, created_at) VALUES (?,?,?,?,?,?)',
+          cid, sid, msg.from === 'consumer' ? cid : sid, msg.content, msg.read, msg.time
         );
       }
     }

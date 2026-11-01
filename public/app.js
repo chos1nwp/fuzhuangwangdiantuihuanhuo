@@ -36,6 +36,10 @@ const ICON_PATHS = {
   tag: '<path d="M20.6 13.4l-7.2 7.2a2 2 0 0 1-2.8 0l-8-8V4h8.6l9.4 9.4z"/><circle cx="7.6" cy="7.6" r="1.2"/>',
   chart: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
   scissors: '<circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><path d="M8.2 7.8L20 19M8.2 16.2L20 5"/>',
+  chat: '<path d="M21 11.5a8.3 8.3 0 0 1-8.5 8.3 8.5 8.5 0 0 1-3.8-.9L3 21l1.9-5.5A8.3 8.3 0 0 1 3 11.5 8.5 8.5 0 0 1 12.5 3 8.3 8.3 0 0 1 21 11.5z"/>',
+  stock: '<rect x="3" y="8" width="18" height="10" rx="1"/><path d="M7 8V5a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v3"/><path d="M7 13h.01M12 13h.01M17 13h.01"/>',
+  plusCircle: '<circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/>',
+  minusCircle: '<circle cx="12" cy="12" r="9"/><path d="M8 12h8"/>',
 };
 
 function icon(name, size = 18) {
@@ -50,6 +54,19 @@ const state = {
   orders: [],
   panel: { action: null, inspect: 'pass', outcome: 'refund' },
   uploadFiles: [],
+  chat: {
+    open: false,
+    activePeer: null,
+    conversations: [],
+    messages: [],
+    unread: 0,
+    polling: null,
+  },
+  inventory: {
+    items: [],
+    filter: 'all',
+    keyword: '',
+  },
 };
 
 const qs = (sel, root = document) => root.querySelector(sel);
@@ -156,10 +173,13 @@ const NAV = {
   ],
   service: [
     { key: 'workbench', hash: '#/workbench', label: '客服工作台', icon: 'inbox' },
+    { key: 'chat', hash: '#/chat', label: '消息中心', icon: 'chat' },
     { key: 'library', hash: '#/library', label: '售后单库', icon: 'list' },
   ],
   warehouse: [
     { key: 'warehouse', hash: '#/warehouse', label: '收货验货台', icon: 'warehouse' },
+    { key: 'inventory', hash: '#/inventory', label: '库存管理', icon: 'stock' },
+    { key: 'replenish', hash: '#/replenish', label: '补货记录', icon: 'truck' },
     { key: 'library', hash: '#/library', label: '退回记录', icon: 'list' },
   ],
 };
@@ -168,7 +188,10 @@ const PAGE_META = {
   orders: { title: '我的订单', desc: '选择已完成的模拟订单商品，发起退货或换货申请' },
   'my-cases': { title: '我的售后', desc: '查看每张售后单的进度、处理说明与凭证' },
   workbench: { title: '客服工作台', desc: '审核申请、跟进退回、处理验货异常与争议' },
+  chat: { title: '消息中心', desc: '与消费者实时沟通，解答售后疑问' },
   warehouse: { title: '收货验货台', desc: '登记退回包裹，记录验货事实与异常' },
+  inventory: { title: '库存管理', desc: '查看库存状态，设置标准量与补货预警' },
+  replenish: { title: '补货记录', desc: '联系厂家补货，跟踪补货进度与收货确认' },
   library: { title: '售后单库', desc: '按单号、买家或商品检索全部售后单' },
   case: { title: '售后单详情', desc: '一张单据上的完整协作记录' },
 };
@@ -316,6 +339,10 @@ function renderLogin(errorMessage) {
       });
       if (!state.meta) state.meta = await api('/api/meta');
       renderShell();
+      if (state.user.role === 'consumer') {
+        renderChatFab();
+      }
+      startChatPolling();
       location.hash = defaultHash();
       renderRoute();
     } catch (e) {
@@ -383,20 +410,36 @@ function renderShell() {
 }
 
 async function loadNavCounts() {
-  if (state.user.role === 'consumer') return;
   try {
-    const s = await api('/api/workbench');
-    const map =
-      state.user.role === 'service'
-        ? { workbench: s.pendingReview + s.needInfo + s.toResolve }
-        : { warehouse: s.toReceive + s.toInspect };
-    Object.entries(map).forEach(([key, n]) => {
-      const el = qs(`[data-count="${key}"]`);
-      if (el && n > 0) {
-        el.textContent = n;
-        el.classList.remove('hidden');
-      }
-    });
+    if (state.user.role === 'service') {
+      const s = await api('/api/workbench');
+      const map = { workbench: s.pendingReview + s.needInfo + s.toResolve };
+      try {
+        const chat = await api('/api/chat/unread');
+        map.chat = chat.count;
+      } catch (e) { /* 忽略 */ }
+      Object.entries(map).forEach(([key, n]) => {
+        const el = qs(`[data-count="${key}"]`);
+        if (el && n > 0) {
+          el.textContent = n;
+          el.classList.remove('hidden');
+        }
+      });
+    } else if (state.user.role === 'warehouse') {
+      const s = await api('/api/workbench');
+      const map = { warehouse: s.toReceive + s.toInspect };
+      try {
+        const inv = await api('/api/inventory/alerts');
+        map.inventory = inv.lowStockCount;
+      } catch (e) { /* 忽略 */ }
+      Object.entries(map).forEach(([key, n]) => {
+        const el = qs(`[data-count="${key}"]`);
+        if (el && n > 0) {
+          el.textContent = n;
+          el.classList.remove('hidden');
+        }
+      });
+    }
   } catch (e) {
     /* 忽略角标失败 */
   }
@@ -410,8 +453,19 @@ async function doLogout() {
   }
   state.user = null;
   state.orders = [];
+  stopChatPolling();
+  removeChatFab();
   location.hash = '';
   renderLogin();
+}
+
+function removeChatFab() {
+  const fab = qs('#chat-fab');
+  if (fab) fab.remove();
+  state.chat.open = false;
+  state.chat.activePeer = null;
+  state.chat.messages = [];
+  state.chat.unread = 0;
 }
 
 /* ==========================================================================
@@ -422,7 +476,10 @@ const ROUTE_ROLES = {
   orders: ['consumer'],
   'my-cases': ['consumer'],
   workbench: ['service'],
+  chat: ['service'],
   warehouse: ['warehouse'],
+  inventory: ['warehouse'],
+  replenish: ['warehouse'],
   library: ['service', 'warehouse'],
 };
 
@@ -450,7 +507,10 @@ function renderRoute() {
   if (key === 'orders') return renderOrders();
   if (key === 'my-cases') return renderMyCases();
   if (key === 'workbench') return renderWorkbench();
+  if (key === 'chat') return renderChatCenter();
   if (key === 'warehouse') return renderWarehouse();
+  if (key === 'inventory') return renderInventory();
+  if (key === 'replenish') return renderReplenishments();
   if (key === 'library') return renderLibrary();
   location.hash = defaultHash();
 }
@@ -1786,6 +1846,983 @@ async function submitAction(c) {
 }
 
 /* ==========================================================================
+   聊天功能
+   ========================================================================== */
+
+let chatPollTimer = null;
+
+function startChatPolling() {
+  if (chatPollTimer) return;
+  chatPollTimer = setInterval(async () => {
+    if (!state.user) return;
+    if (state.user.role !== 'consumer' && state.user.role !== 'service') return;
+    try {
+      const res = await api('/api/chat/unread');
+      state.chat.unread = res.count;
+      // 更新导航栏未读角标
+      const badge = qs('[data-count="chat"]');
+      if (badge) {
+        if (res.count > 0) {
+          badge.textContent = res.count;
+          badge.classList.remove('hidden');
+        } else {
+          badge.classList.add('hidden');
+        }
+      }
+
+      // 更新消费者悬浮按钮的未读红点
+      if (state.user.role === 'consumer') {
+        const fabBadge = qs('#chat-fab .chat-fab-badge');
+        if (fabBadge) {
+          if (res.count > 0) {
+            fabBadge.textContent = res.count;
+            fabBadge.classList.remove('hidden');
+          } else {
+            fabBadge.classList.add('hidden');
+          }
+        }
+      }
+
+      // 客服端：如果在消息中心页面，刷新会话列表
+      if (state.user.role === 'service' && location.hash === '#/chat') {
+        refreshChatConversations();
+      }
+
+      // 消费者端：如果聊天窗口打开，刷新消息
+      if (state.user.role === 'consumer' && state.chat.open && state.chat.activePeer) {
+        refreshChatMessages();
+      }
+
+      // 客服端：如果在消息中心且有活跃会话，刷新消息
+      if (state.user.role === 'service' && location.hash === '#/chat' && state.chat.activePeer) {
+        refreshChatCenterMessagesSilent();
+      }
+    } catch (e) { /* 忽略 */ }
+  }, 5000);
+}
+
+// 刷新会话列表（客服端消息中心）
+async function refreshChatConversations() {
+  try {
+    const convs = await api('/api/chat/conversations');
+    const oldCount = state.chat.conversations.length;
+    state.chat.conversations = convs;
+
+    // 更新会话列表 DOM
+    const listEl = qs('#chat-conv-items');
+    if (listEl) {
+      listEl.innerHTML = convs.length === 0 ? `<div class="chat-empty">暂无会话</div>` :
+        convs.map((c) => `
+          <div class="chat-conv-item ${c.peerId === state.chat.activePeer ? 'active' : ''}" data-peer="${c.peerId}">
+            <div class="chat-conv-avatar">${esc(c.peerName[0])}</div>
+            <div class="chat-conv-info">
+              <div class="chat-conv-name">
+                <span>${esc(c.peerName)}</span>
+                ${c.unread > 0 ? `<span class="chat-conv-unread">${c.unread}</span>` : ''}
+              </div>
+              <div class="chat-conv-last">${esc(c.lastMessage || '')}</div>
+            </div>
+            <div class="chat-conv-time">${fmtDT(c.lastTime)}</div>
+          </div>
+        `).join('');
+
+      // 重新绑定点击事件
+      qsa('.chat-conv-item').forEach((el) => {
+        el.addEventListener('click', async () => {
+          const peerId = Number(el.dataset.peer);
+          qsa('.chat-conv-item').forEach((e) => e.classList.remove('active'));
+          el.classList.add('active');
+          state.chat.activePeer = peerId;
+          await loadChatCenterMessages(peerId);
+        });
+      });
+    }
+  } catch (e) { /* 忽略 */ }
+}
+
+// 静默刷新客服端当前会话消息（不滚动到底部）
+async function refreshChatCenterMessagesSilent() {
+  if (!state.chat.activePeer) return;
+  try {
+    const messages = await api(`/api/chat/messages?peer=${state.chat.activePeer}`);
+    const oldLen = state.chat.messages.length;
+    state.chat.messages = messages;
+
+    if (messages.length > oldLen) {
+      const msgEl = qs('#chat-msg-list');
+      if (msgEl) {
+        const wasAtBottom = msgEl.scrollTop + msgEl.clientHeight >= msgEl.scrollHeight - 30;
+        // 只追加新消息
+        const newMsgs = messages.slice(oldLen);
+        newMsgs.forEach((m) => {
+          const div = document.createElement('div');
+          div.className = `chat-msg ${m.isMine ? 'mine' : 'theirs'}`;
+          div.innerHTML = `
+            ${!m.isMine ? `<div class="chat-msg-avatar">顾</div>` : ''}
+            <div class="chat-msg-bubble">${esc(m.content)}</div>
+            ${m.isMine ? `<div class="chat-msg-avatar mine violet">我</div>` : ''}
+          `;
+          msgEl.appendChild(div);
+        });
+        if (wasAtBottom) {
+          msgEl.scrollTop = msgEl.scrollHeight;
+        }
+      }
+    }
+  } catch (e) { /* 忽略 */ }
+}
+
+function stopChatPolling() {
+  if (chatPollTimer) {
+    clearInterval(chatPollTimer);
+    chatPollTimer = null;
+  }
+}
+
+/* ---------- 消费者端：悬浮客服按钮 ---------- */
+
+function renderChatFab() {
+  if (state.user.role !== 'consumer') return;
+  const existing = qs('#chat-fab');
+  if (existing) existing.remove();
+
+  const fab = document.createElement('div');
+  fab.id = 'chat-fab';
+  fab.className = 'chat-fab';
+  fab.innerHTML = `
+    <button class="chat-fab-btn" data-act="toggle-chat">
+      ${icon('chat', 22)}
+      <span class="chat-fab-badge ${state.chat.unread > 0 ? '' : 'hidden'}">${state.chat.unread}</span>
+    </button>
+    <div class="chat-window ${state.chat.open ? 'open' : ''}" id="chat-window">
+      <div class="chat-header">
+        <div class="chat-header-info">
+          <span class="chat-avatar violet">客</span>
+          <div>
+            <div class="chat-name">在线客服</div>
+            <div class="chat-status"><span class="online-dot"></span>客服在线</div>
+          </div>
+        </div>
+        <button class="icon-btn" data-act="close-chat">${icon('close', 16)}</button>
+      </div>
+      <div class="chat-messages" id="chat-messages">
+        <div class="chat-loading">${icon('refresh', 16)} 加载中…</div>
+      </div>
+      <div class="chat-input-area">
+        <input type="text" class="chat-input" id="chat-input" placeholder="输入消息，按 Enter 发送" maxlength="2000" />
+        <button class="chat-send-btn" data-act="send-chat-msg">${icon('arrow', 18)}</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(fab);
+
+  // 初始加载消息（默认找第一个客服）
+  if (state.chat.open) {
+    loadOrStartChat();
+  }
+}
+
+async function toggleChat() {
+  state.chat.open = !state.chat.open;
+  const win = qs('#chat-window');
+  if (win) win.classList.toggle('open', state.chat.open);
+  if (state.chat.open) {
+    loadOrStartChat();
+  }
+}
+
+async function loadOrStartChat() {
+  const msgEl = qs('#chat-messages');
+  if (!msgEl) return;
+  try {
+    const convs = await api('/api/chat/conversations');
+    state.chat.conversations = convs;
+    if (convs.length > 0) {
+      state.chat.activePeer = convs[0].peerId;
+      await loadChatMessages(convs[0].peerId);
+    } else {
+      // 没有历史对话，显示客服选择列表
+      const services = await api('/api/chat/service-list');
+      msgEl.innerHTML = `
+        <div class="chat-welcome">
+          <div class="chat-welcome-icon">${icon('chat', 32)}</div>
+          <div class="chat-welcome-title">选择客服开始对话</div>
+          <div class="chat-welcome-desc">点击下方客服卡片开始咨询</div>
+        </div>
+        <div class="chat-service-list">
+          ${services.map((s) => `
+            <div class="chat-service-item" data-service-id="${s.id}">
+              <div class="chat-service-avatar violet">${esc(s.name[0])}</div>
+              <div class="chat-service-info">
+                <div class="chat-service-name">${esc(s.name)}</div>
+                <div class="chat-service-title">${esc(s.title || '在线客服')}</div>
+              </div>
+              <span class="online-dot"></span>
+            </div>
+          `).join('')}
+        </div>
+      `;
+      state.chat.activePeer = null;
+      // 绑定客服选择
+      qsa('.chat-service-item').forEach((el) => {
+        el.addEventListener('click', () => {
+          state.chat.activePeer = Number(el.dataset.serviceId);
+          const name = el.querySelector('.chat-service-name').textContent;
+          // 更新头部名称
+          const headerName = qs('#chat-window .chat-name');
+          if (headerName) headerName.textContent = name;
+          loadChatMessages(state.chat.activePeer);
+        });
+      });
+    }
+  } catch (e) {
+    msgEl.innerHTML = `<div class="chat-error">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+async function loadChatMessages(peerId) {
+  const msgEl = qs('#chat-messages');
+  if (!msgEl) return;
+  try {
+    const messages = await api(`/api/chat/messages?peer=${peerId}`);
+    state.chat.messages = messages;
+    renderChatMessages();
+  } catch (e) {
+    msgEl.innerHTML = `<div class="chat-error">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+async function refreshChatMessages() {
+  if (!state.chat.activePeer) return;
+  try {
+    const messages = await api(`/api/chat/messages?peer=${state.chat.activePeer}`);
+    const oldLen = state.chat.messages.length;
+    state.chat.messages = messages;
+    if (messages.length > oldLen) {
+      renderChatMessages();
+    }
+  } catch (e) { /* 忽略 */ }
+}
+
+function renderChatMessages() {
+  const msgEl = qs('#chat-messages');
+  if (!msgEl) return;
+  const messages = state.chat.messages;
+  if (messages.length === 0) {
+    msgEl.innerHTML = `<div class="chat-empty">暂无消息</div>`;
+    return;
+  }
+  msgEl.innerHTML = messages.map((m) => `
+    <div class="chat-msg ${m.isMine ? 'mine' : 'theirs'}">
+      ${!m.isMine ? `<div class="chat-msg-avatar violet">客</div>` : ''}
+      <div class="chat-msg-bubble">${esc(m.content)}</div>
+      ${m.isMine ? `<div class="chat-msg-avatar mine">我</div>` : ''}
+    </div>
+  `).join('');
+  msgEl.scrollTop = msgEl.scrollHeight;
+}
+
+async function sendChatMessage() {
+  const input = qs('#chat-input');
+  if (!input) return;
+  const content = input.value.trim();
+  if (!content) return;
+
+  if (!state.chat.activePeer) {
+    toast('请先选择一位客服', 'error');
+    return;
+  }
+
+  input.value = '';
+  try {
+    const msg = await api('/api/chat/messages', {
+      method: 'POST',
+      body: JSON.stringify({ peerId: state.chat.activePeer, content })
+    });
+    state.chat.messages.push(msg);
+    renderChatMessages();
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
+/* ---------- 客服端：消息中心 ---------- */
+
+async function renderChatCenter() {
+  const view = qs('#view');
+  view.innerHTML = loadingHTML();
+  try {
+    const convs = await api('/api/chat/conversations');
+    state.chat.conversations = convs;
+    state.chat.messages = [];
+    state.chat.activePeer = convs.length > 0 ? convs[0].peerId : null;
+
+    view.innerHTML = `
+      ${topbar('消息中心', '与消费者实时沟通，解答售后疑问')}
+      <div class="chat-layout">
+        <div class="chat-conv-list">
+          <div class="chat-conv-header">
+            <span class="chat-conv-title">会话列表</span>
+            <span class="chat-conv-count">${convs.length} 位</span>
+          </div>
+          <div class="chat-conv-items" id="chat-conv-items">
+            ${convs.length === 0 ? `<div class="chat-empty">暂无会话</div>` :
+              convs.map((c, i) => `
+                <div class="chat-conv-item ${i === 0 ? 'active' : ''}" data-peer="${c.peerId}">
+                  <div class="chat-conv-avatar">${esc(c.peerName[0])}</div>
+                  <div class="chat-conv-info">
+                    <div class="chat-conv-name">
+                      <span>${esc(c.peerName)}</span>
+                      ${c.unread > 0 ? `<span class="chat-conv-unread">${c.unread}</span>` : ''}
+                    </div>
+                    <div class="chat-conv-last">${esc(c.lastMessage || '')}</div>
+                  </div>
+                  <div class="chat-conv-time">${fmtDT(c.lastTime)}</div>
+                </div>
+              `).join('')
+            }
+          </div>
+        </div>
+        <div class="chat-main" id="chat-main">
+          ${state.chat.activePeer ? renderChatMainHTML() : `
+            <div class="chat-empty-state">
+              ${icon('chat', 40)}
+              <p>选择左侧会话开始对话</p>
+            </div>
+          `}
+        </div>
+      </div>
+    `;
+
+    if (state.chat.activePeer) {
+      await loadChatCenterMessages(state.chat.activePeer);
+    }
+
+    // 绑定会话列表点击
+    qsa('.chat-conv-item').forEach((el) => {
+      el.addEventListener('click', async () => {
+        const peerId = Number(el.dataset.peer);
+        qsa('.chat-conv-item').forEach((e) => e.classList.remove('active'));
+        el.classList.add('active');
+        state.chat.activePeer = peerId;
+        await loadChatCenterMessages(peerId);
+      });
+    });
+  } catch (e) {
+    view.innerHTML = errorHTML(e);
+  }
+}
+
+function renderChatMainHTML() {
+  const conv = state.chat.conversations.find((c) => c.peerId === state.chat.activePeer);
+  const peerName = conv ? conv.peerName : '对话';
+  return `
+    <div class="chat-panel-header">
+      <div class="chat-panel-name">
+        <span class="chat-avatar">${esc(peerName[0])}</span>
+        <div>
+          <div class="chat-name">${esc(peerName)}</div>
+          <div class="chat-status"><span class="online-dot"></span>在线</div>
+        </div>
+      </div>
+    </div>
+    <div class="chat-messages chat-messages-lg" id="chat-msg-list">
+      <div class="chat-loading">${icon('refresh', 16)} 加载中…</div>
+    </div>
+    <div class="chat-input-area chat-input-area-lg">
+      <input type="text" class="chat-input" id="chat-center-input" placeholder="输入消息，按 Enter 发送" maxlength="2000" />
+      <button class="chat-send-btn" data-act="send-chat-center-msg">发送</button>
+    </div>
+  `;
+}
+
+async function loadChatCenterMessages(peerId) {
+  const msgEl = qs('#chat-msg-list');
+  if (!msgEl) return;
+  try {
+    const messages = await api(`/api/chat/messages?peer=${peerId}`);
+    state.chat.messages = messages;
+    renderChatCenterMessages();
+    loadNavCounts();
+  } catch (e) {
+    msgEl.innerHTML = `<div class="chat-error">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+function renderChatCenterMessages() {
+  const msgEl = qs('#chat-msg-list');
+  if (!msgEl) return;
+  const messages = state.chat.messages;
+  if (messages.length === 0) {
+    msgEl.innerHTML = `<div class="chat-empty">暂无消息，发送第一条消息开始对话</div>`;
+    return;
+  }
+  msgEl.innerHTML = messages.map((m) => `
+    <div class="chat-msg ${m.isMine ? 'mine' : 'theirs'}">
+      ${!m.isMine ? `<div class="chat-msg-avatar">${m.isMine ? '我' : '顾'}</div>` : ''}
+      <div class="chat-msg-bubble">${esc(m.content)}</div>
+      ${m.isMine ? `<div class="chat-msg-avatar mine violet">我</div>` : ''}
+    </div>
+  `).join('');
+  msgEl.scrollTop = msgEl.scrollHeight;
+}
+
+async function sendChatCenterMessage() {
+  const input = qs('#chat-center-input');
+  if (!input || !state.chat.activePeer) return;
+  const content = input.value.trim();
+  if (!content) return;
+  input.value = '';
+  try {
+    const msg = await api('/api/chat/messages', {
+      method: 'POST',
+      body: JSON.stringify({ peerId: state.chat.activePeer, content })
+    });
+    state.chat.messages.push(msg);
+    renderChatCenterMessages();
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
+/* ==========================================================================
+   库存管理（仓库端）
+   ========================================================================== */
+
+async function renderInventory() {
+  const view = qs('#view');
+  view.innerHTML = loadingHTML();
+  try {
+    const [alerts, items] = await Promise.all([
+      api('/api/inventory/alerts'),
+      api('/api/inventory')
+    ]);
+    state.inventory.items = items;
+
+    view.innerHTML = `
+      ${topbar('库存管理', '查看库存状态，设置标准量与补货预警', `
+        <div class="topbar-actions">
+          <div class="search-box">
+            ${icon('search', 16)}
+            <input type="text" id="inv-search" placeholder="搜索 SKU / 商品名 / 颜色 / 尺码" value="${esc(state.inventory.keyword)}" />
+          </div>
+          <div class="seg">
+            <button class="seg-btn ${state.inventory.filter === 'all' ? 'active' : ''}" data-inv-filter="all">全部</button>
+            <button class="seg-btn ${state.inventory.filter === 'low' ? 'active' : ''}" data-inv-filter="low">
+              ${icon('alert', 14)} 库存不足 ${alerts.lowStockCount > 0 ? `(${alerts.lowStockCount})` : ''}
+            </button>
+          </div>
+        </div>
+      `)}
+
+      <div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
+        <div class="stat-card">
+          <div class="stat-label">SKU 总数</div>
+          <div class="stat-value">${alerts.totalCount}</div>
+          <div class="stat-trend">个商品规格</div>
+        </div>
+        <div class="stat-card warn">
+          <div class="stat-label">库存不足</div>
+          <div class="stat-value">${alerts.lowStockCount}</div>
+          <div class="stat-trend">需要补货</div>
+        </div>
+        <div class="stat-card danger">
+          <div class="stat-label">总缺口数量</div>
+          <div class="stat-value">${alerts.totalShortage}</div>
+          <div class="stat-trend">件商品需补充</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="inv-table-wrap">
+          <table class="inv-table">
+            <thead>
+              <tr>
+                <th>SKU</th>
+                <th>商品名称</th>
+                <th>颜色</th>
+                <th>尺码</th>
+                <th>库位</th>
+                <th class="num">当前库存</th>
+                <th class="num">标准量</th>
+                <th class="num">缺口</th>
+                <th>状态</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="inv-tbody">
+              ${items.length === 0 ? `<tr><td colspan="10" class="empty-cell">暂无数据</td></tr>` :
+                items.map((item) => renderInvRow(item)).join('')
+              }
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+
+    // 搜索
+    const searchInput = qs('#inv-search');
+    if (searchInput) {
+      let t;
+      searchInput.addEventListener('input', () => {
+        clearTimeout(t);
+        t = setTimeout(() => {
+          state.inventory.keyword = searchInput.value;
+          filterInventory();
+        }, 300);
+      });
+    }
+
+    // 筛选按钮
+    qsa('[data-inv-filter]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        state.inventory.filter = btn.dataset.invFilter;
+        qsa('[data-inv-filter]').forEach((b) => b.classList.toggle('active', b === btn));
+        filterInventory();
+      });
+    });
+
+    // 操作按钮
+    bindInventoryActions();
+  } catch (e) {
+    view.innerHTML = errorHTML(e);
+  }
+}
+
+function renderInvRow(item) {
+  return `
+    <tr class="${item.isLow ? 'inv-low' : ''}">
+      <td class="mono">${esc(item.sku)}</td>
+      <td>${esc(item.title)}</td>
+      <td>${esc(item.color)}</td>
+      <td>${esc(item.size)}</td>
+      <td class="mono muted">${esc(item.location || '—')}</td>
+      <td class="num ${item.isLow ? 'danger-text' : ''}"><b>${item.stockQty}</b></td>
+      <td class="num">${item.standardQty}</td>
+      <td class="num">${item.isLow ? `<span class="danger-text">-${item.shortage}</span>` : '—'}</td>
+      <td>
+        ${item.isLow 
+          ? `<span class="chip danger-chip">${icon('alert', 12)} 库存不足</span>` 
+          : `<span class="chip ok-chip">${icon('check', 12)} 正常</span>`
+        }
+      </td>
+      <td>
+        <div class="row-actions">
+          <button class="link-btn" data-act="edit-std" data-id="${item.id}">设置标准量</button>
+          <button class="link-btn" data-act="adjust-stock" data-id="${item.id}">调整库存</button>
+          ${item.isLow ? `<button class="link-btn primary-link" data-act="replenish" data-id="${item.id}">${icon('plusCircle', 12)} 联系补货</button>` : ''}
+        </div>
+      </td>
+    </tr>
+  `;
+}
+
+async function filterInventory() {
+  const tbody = qs('#inv-tbody');
+  if (!tbody) return;
+  try {
+    const params = new URLSearchParams();
+    if (state.inventory.keyword) params.set('q', state.inventory.keyword);
+    if (state.inventory.filter === 'low') params.set('low', '1');
+    const items = await api(`/api/inventory?${params.toString()}`);
+    state.inventory.items = items;
+    tbody.innerHTML = items.length === 0 
+      ? `<tr><td colspan="10" class="empty-cell">没有匹配的库存记录</td></tr>`
+      : items.map((i) => renderInvRow(i)).join('');
+    bindInventoryActions();
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
+function bindInventoryActions() {
+  qsa('[data-act="edit-std"]').forEach((btn) => {
+    btn.addEventListener('click', () => openStdModal(Number(btn.dataset.id)));
+  });
+  qsa('[data-act="adjust-stock"]').forEach((btn) => {
+    btn.addEventListener('click', () => openAdjustModal(Number(btn.dataset.id)));
+  });
+  qsa('[data-act="replenish"]').forEach((btn) => {
+    btn.addEventListener('click', () => openReplenishModal(Number(btn.dataset.id)));
+  });
+}
+
+function openReplenishModal(invId) {
+  const item = state.inventory.items.find((i) => i.id === invId);
+  if (!item) return;
+  const suggestedQty = item.shortage + 20; // 建议补货量 = 缺口 + 20
+
+  openModal(`
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3>联系厂家补货</h3>
+        <button class="icon-btn" data-act="close-modal">${icon('close', 16)}</button>
+      </div>
+      <div class="modal-body">
+        <div class="inv-modal-info">
+          <div><span class="muted">商品：</span>${esc(item.title)}</div>
+          <div><span class="muted">规格：</span>${esc(item.color)} / ${esc(item.size)}</div>
+          <div><span class="muted">SKU：</span><span class="mono">${esc(item.sku)}</span></div>
+          <div><span class="muted">当前库存：</span><b class="danger-text">${item.stockQty}</b> / 标准量 ${item.standardQty} 件</div>
+          <div><span class="muted">缺口数量：</span><b class="danger-text">${item.shortage}</b> 件</div>
+        </div>
+        <div class="field">
+          <label>补货数量 <span class="required">*</span></label>
+          <input type="number" class="input" id="repl-qty" value="${suggestedQty}" min="1" />
+          <div class="hint">建议补货 ${suggestedQty} 件（缺口 + 安全库存 20 件）</div>
+        </div>
+        <div class="field">
+          <label>供应商/厂家</label>
+          <input type="text" class="input" id="repl-supplier" placeholder="如：上海锦泓制衣有限公司" maxlength="80" />
+        </div>
+        <div class="field">
+          <label>备注</label>
+          <textarea class="input" id="repl-note" rows="3" placeholder="选填，例如：尺码L库存不足，紧急补货" maxlength="500"></textarea>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn ghost" data-act="close-modal">取消</button>
+        <button class="btn primary" id="submit-repl-btn">${icon('truck', 14)} 提交补货申请</button>
+      </div>
+    </div>
+  `);
+
+  qs('#submit-repl-btn').addEventListener('click', async () => {
+    const qty = Number(qs('#repl-qty').value);
+    const supplier = qs('#repl-supplier').value.trim();
+    const note = qs('#repl-note').value.trim();
+
+    if (!Number.isInteger(qty) || qty <= 0) {
+      toast('请输入有效的补货数量', 'error');
+      return;
+    }
+
+    try {
+      await api('/api/replenishments', {
+        method: 'POST',
+        body: JSON.stringify({ inventoryId: invId, qty, supplier, note })
+      });
+      toast('补货申请已提交', 'ok');
+      closeModal();
+      filterInventory();
+      loadNavCounts();
+    } catch (e) {
+      toast(e.message, 'error');
+    }
+  });
+}
+
+function openStdModal(id) {
+  const item = state.inventory.items.find((i) => i.id === id);
+  if (!item) return;
+  openModal(`
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3>设置标准库存量</h3>
+        <button class="icon-btn" data-act="close-modal">${icon('close', 16)}</button>
+      </div>
+      <div class="modal-body">
+        <div class="inv-modal-info">
+          <div><span class="muted">商品：</span>${esc(item.title)}</div>
+          <div><span class="muted">规格：</span>${esc(item.color)} / ${esc(item.size)}</div>
+          <div><span class="muted">当前库存：</span><b>${item.stockQty}</b> 件</div>
+        </div>
+        <div class="field">
+          <label>标准库存量 <span class="required">*</span></label>
+          <input type="number" class="input" id="std-qty" value="${item.standardQty}" min="0" />
+          <div class="hint">当实际库存低于此值时，系统将提示补货</div>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn ghost" data-act="close-modal">取消</button>
+        <button class="btn primary" id="save-std-btn">保存设置</button>
+      </div>
+    </div>
+  `);
+
+  qs('#save-std-btn').addEventListener('click', async () => {
+    const val = Number(qs('#std-qty').value);
+    if (!Number.isInteger(val) || val < 0) {
+      toast('请输入有效的数量', 'error');
+      return;
+    }
+    try {
+      await api(`/api/inventory/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ standardQty: val })
+      });
+      toast('标准量已更新', 'ok');
+      closeModal();
+      filterInventory();
+      loadNavCounts();
+    } catch (e) {
+      toast(e.message, 'error');
+    }
+  });
+}
+
+function openAdjustModal(id) {
+  const item = state.inventory.items.find((i) => i.id === id);
+  if (!item) return;
+  openModal(`
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3>调整库存</h3>
+        <button class="icon-btn" data-act="close-modal">${icon('close', 16)}</button>
+      </div>
+      <div class="modal-body">
+        <div class="inv-modal-info">
+          <div><span class="muted">商品：</span>${esc(item.title)}</div>
+          <div><span class="muted">规格：</span>${esc(item.color)} / ${esc(item.size)}</div>
+          <div><span class="muted">当前库存：</span><b>${item.stockQty}</b> 件</div>
+        </div>
+        <div class="field">
+          <label>调整数量 <span class="required">*</span></label>
+          <div class="adjust-input-wrap">
+            <button class="adjust-btn" id="adj-minus">${icon('minusCircle', 28)}</button>
+            <input type="number" class="input adjust-input" id="adj-qty" value="0" />
+            <button class="adjust-btn" id="adj-plus">${icon('plusCircle', 28)}</button>
+          </div>
+          <div class="hint">正数为入库，负数为出库</div>
+        </div>
+        <div class="adj-preview">
+          调整后：<b id="adj-preview">${item.stockQty}</b> 件
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn ghost" data-act="close-modal">取消</button>
+        <button class="btn primary" id="save-adj-btn">确认调整</button>
+      </div>
+    </div>
+  `);
+
+  const input = qs('#adj-qty');
+  const preview = qs('#adj-preview');
+
+  function updatePreview() {
+    const delta = Number(input.value) || 0;
+    const newVal = item.stockQty + delta;
+    preview.textContent = newVal < 0 ? '不能为负' : newVal;
+    preview.classList.toggle('danger-text', newVal < 0);
+  }
+
+  qs('#adj-minus').addEventListener('click', () => {
+    input.value = (Number(input.value) || 0) - 1;
+    updatePreview();
+  });
+  qs('#adj-plus').addEventListener('click', () => {
+    input.value = (Number(input.value) || 0) + 1;
+    updatePreview();
+  });
+  input.addEventListener('input', updatePreview);
+
+  qs('#save-adj-btn').addEventListener('click', async () => {
+    const delta = Number(input.value);
+    if (!Number.isInteger(delta) || delta === 0) {
+      toast('请输入调整数量', 'error');
+      return;
+    }
+    try {
+      await api(`/api/inventory/${id}/adjust`, {
+        method: 'POST',
+        body: JSON.stringify({ delta })
+      });
+      toast(delta > 0 ? `入库 ${delta} 件成功` : `出库 ${Math.abs(delta)} 件成功`, 'ok');
+      closeModal();
+      filterInventory();
+      loadNavCounts();
+    } catch (e) {
+      toast(e.message, 'error');
+    }
+  });
+}
+
+/* ==========================================================================
+   补货记录
+   ========================================================================== */
+
+const REPL_STATUS_MAP = {
+  pending:   { label: '待处理',   cls: 'warn-chip',   icon: 'clock' },
+  shipped:   { label: '运输中',   cls: 'violet-chip', icon: 'truck' },
+  received:  { label: '已完成',   cls: 'ok-chip',     icon: 'check' },
+  cancelled: { label: '已取消',   cls: 'muted-chip',  icon: 'close' },
+};
+
+let replFilter = 'all';
+
+async function renderReplenishments() {
+  const view = qs('#view');
+  view.innerHTML = loadingHTML();
+  try {
+    const [stats, list] = await Promise.all([
+      api('/api/replenishments/stats'),
+      api(`/api/replenishments?status=${replFilter}`)
+    ]);
+
+    view.innerHTML = `
+      ${topbar('补货记录', '联系厂家补货，跟踪补货进度与收货确认', `
+        <div class="topbar-actions">
+          <div class="seg">
+            <button class="seg-btn ${replFilter === 'all' ? 'active' : ''}" data-repl-filter="all">全部 ${stats.total}</button>
+            <button class="seg-btn ${replFilter === 'pending' ? 'active' : ''}" data-repl-filter="pending">待处理 ${stats.pending}</button>
+            <button class="seg-btn ${replFilter === 'shipped' ? 'active' : ''}" data-repl-filter="shipped">运输中 ${stats.shipped}</button>
+            <button class="seg-btn ${replFilter === 'received' ? 'active' : ''}" data-repl-filter="received">已完成</button>
+          </div>
+        </div>
+      `)}
+
+      <div class="stat-grid" style="grid-template-columns:repeat(4,1fr)">
+        <div class="stat-card">
+          <div class="stat-label">补货申请总数</div>
+          <div class="stat-value">${stats.total}</div>
+          <div class="stat-trend">笔</div>
+        </div>
+        <div class="stat-card warn">
+          <div class="stat-label">待处理</div>
+          <div class="stat-value">${stats.pending}</div>
+          <div class="stat-trend">等待厂家发货</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">运输中</div>
+          <div class="stat-value">${stats.shipped}</div>
+          <div class="stat-trend">在途商品</div>
+        </div>
+        <div class="stat-card danger">
+          <div class="stat-label">待补总件数</div>
+          <div class="stat-value">${stats.pendingQty}</div>
+          <div class="stat-trend">件商品在路上</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="inv-table-wrap">
+          <table class="inv-table">
+            <thead>
+              <tr>
+                <th>商品信息</th>
+                <th>SKU</th>
+                <th class="num">补货数量</th>
+                <th>供应商</th>
+                <th>状态</th>
+                <th>申请人</th>
+                <th>申请时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="repl-tbody">
+              ${list.length === 0 ? `<tr><td colspan="8" class="empty-cell">暂无补货记录</td></tr>` :
+                list.map((r) => renderReplRow(r)).join('')
+              }
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+
+    // 筛选按钮
+    qsa('[data-repl-filter]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        replFilter = btn.dataset.replFilter;
+        qsa('[data-repl-filter]').forEach((b) => b.classList.toggle('active', b === btn));
+        loadReplList();
+      });
+    });
+
+    bindReplActions();
+  } catch (e) {
+    view.innerHTML = errorHTML(e);
+  }
+}
+
+async function loadReplList() {
+  const tbody = qs('#repl-tbody');
+  if (!tbody) return;
+  try {
+    const list = await api(`/api/replenishments?status=${replFilter}`);
+    tbody.innerHTML = list.length === 0
+      ? `<tr><td colspan="8" class="empty-cell">暂无补货记录</td></tr>`
+      : list.map((r) => renderReplRow(r)).join('');
+    bindReplActions();
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
+function renderReplRow(r) {
+  const status = REPL_STATUS_MAP[r.status] || REPL_STATUS_MAP.pending;
+  return `
+    <tr>
+      <td>
+        <div class="repl-product">
+          <div class="repl-product-name">${esc(r.title)}</div>
+          <div class="repl-product-spec muted">${esc(r.color)} / ${esc(r.size)}</div>
+        </div>
+      </td>
+      <td class="mono">${esc(r.sku)}</td>
+      <td class="num"><b>${r.qty}</b> 件</td>
+      <td>${esc(r.supplier || '—')}</td>
+      <td>
+        <span class="chip ${status.cls}">${icon(status.icon, 12)} ${status.label}</span>
+      </td>
+      <td>${esc(r.creatorName)}</td>
+      <td class="muted">${fmtDT(r.created_at || r.createdAt)}</td>
+      <td>
+        <div class="row-actions">
+          ${r.status === 'pending' ? `
+            <button class="link-btn" data-act="repl-ship" data-id="${r.id}">标记发货</button>
+            <button class="link-btn danger-link" data-act="repl-cancel" data-id="${r.id}">取消</button>
+          ` : ''}
+          ${r.status === 'shipped' ? `
+            <button class="link-btn primary-link" data-act="repl-receive" data-id="${r.id}">${icon('check', 12)} 确认收货</button>
+          ` : ''}
+          ${r.status === 'received' ? `
+            <span class="muted">${fmtDT(r.receivedAt || r.received_at)}</span>
+          ` : ''}
+          ${r.status === 'cancelled' ? `
+            <span class="muted">已取消</span>
+          ` : ''}
+        </div>
+      </td>
+    </tr>
+  `;
+}
+
+function bindReplActions() {
+  qsa('[data-act="repl-ship"]').forEach((btn) => {
+    btn.addEventListener('click', () => updateReplStatus(Number(btn.dataset.id), 'ship'));
+  });
+  qsa('[data-act="repl-receive"]').forEach((btn) => {
+    btn.addEventListener('click', () => updateReplStatus(Number(btn.dataset.id), 'receive'));
+  });
+  qsa('[data-act="repl-cancel"]').forEach((btn) => {
+    btn.addEventListener('click', () => updateReplStatus(Number(btn.dataset.id), 'cancel'));
+  });
+}
+
+async function updateReplStatus(id, action) {
+  const actionText = { ship: '标记发货', receive: '确认收货', cancel: '取消补货' }[action];
+  const confirmText = {
+    ship: '确定标记这批补货为已发货状态吗？',
+    receive: '确认收到货物后，库存数量将自动增加。确定吗？',
+    cancel: '确定取消这笔补货申请吗？',
+  }[action];
+
+  if (!confirm(confirmText)) return;
+
+  try {
+    await api(`/api/replenishments/${id}/status`, {
+      method: 'PUT',
+      body: JSON.stringify({ action })
+    });
+    toast(`${actionText}成功`, 'ok');
+    loadReplList();
+    loadNavCounts();
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
+/* ==========================================================================
    全局事件
    ========================================================================== */
 
@@ -1802,6 +2839,31 @@ document.addEventListener('click', (e) => {
   if (act === 'apply') {
     e.preventDefault();
     openApplyModal(el.dataset.item ? Number(el.dataset.item) : null);
+  }
+  if (act === 'toggle-chat' || act === 'close-chat') {
+    toggleChat();
+  }
+  if (act === 'send-chat-msg') {
+    sendChatMessage();
+  }
+  if (act === 'send-chat-center-msg') {
+    sendChatCenterMessage();
+  }
+});
+
+// 聊天输入框回车发送
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    const chatInput = qs('#chat-input');
+    const chatCenterInput = qs('#chat-center-input');
+    if (e.target === chatInput) {
+      e.preventDefault();
+      sendChatMessage();
+    }
+    if (e.target === chatCenterInput) {
+      e.preventDefault();
+      sendChatCenterMessage();
+    }
   }
 });
 
@@ -1830,6 +2892,10 @@ async function boot() {
     return;
   }
   renderShell();
+  if (state.user.role === 'consumer') {
+    renderChatFab();
+  }
+  startChatPolling();
   if (!location.hash || location.hash === '#/') {
     location.hash = defaultHash();
   }
